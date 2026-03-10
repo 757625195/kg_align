@@ -54,6 +54,14 @@ class Config:
     num_neighbors: int = 8
 
     # =========================
+    # Ablation
+    # =========================
+    use_mst: bool = True
+    use_light_gnn: bool = True
+    use_cross_modal_enhancement: bool = True
+    ablation_name: str = "full"
+
+    # =========================
     # Loss
     # =========================
     lambda_struct: float = 0.2
@@ -85,11 +93,42 @@ class Config:
     seed: int = 42
     save_dir: str = "outputs"
 
+    @property
+    def experiment_tag(self) -> str:
+        disabled = []
+        if not self.use_mst:
+            disabled.append("w_o_MST")
+        if not self.use_light_gnn:
+            disabled.append("w_o_LightGNN")
+        if not self.use_cross_modal_enhancement:
+            disabled.append("w_o_CE")
+        if not self.do_active_learning:
+            disabled.append("w_o_AL")
+        return "full_model" if not disabled else "_".join(disabled)
+
 
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def apply_ablation_config(cfg: Config) -> None:
+    if cfg.ablation_name == "full":
+        return
+    if cfg.ablation_name == "w_o_MST":
+        cfg.use_mst = False
+        return
+    if cfg.ablation_name == "w_o_LightGNN":
+        cfg.use_light_gnn = False
+        return
+    if cfg.ablation_name == "w_o_CE":
+        cfg.use_cross_modal_enhancement = False
+        return
+    if cfg.ablation_name == "w_o_AL":
+        cfg.do_active_learning = False
+        return
+    raise ValueError(f"Unsupported ablation_name: {cfg.ablation_name}")
 
 
 def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
@@ -104,6 +143,9 @@ def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
         text_heads=cfg.text_heads,
         text_layers=cfg.text_layers,
         dropout=cfg.dropout,
+        use_mst=cfg.use_mst,
+        use_light_gnn=cfg.use_light_gnn,
+        use_cross_modal_enhancement=cfg.use_cross_modal_enhancement,
     )
 
 
@@ -320,6 +362,7 @@ def train_one_epoch(
 
 def main():
     cfg = Config()
+    apply_ablation_config(cfg)
     set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
@@ -338,11 +381,19 @@ def main():
     adj_list = build_adj_list(data["edge_index"].cpu(), total_nodes)
 
     print(f"Pair: {cfg.pair}")
+    print(f"Experiment: {cfg.experiment_tag}")
     print(f"Total nodes: {total_nodes}")
     print(f"Edges total: {edge_index.size(1)}")
     print(f"Train pairs: {len(train_pairs)}")
     print(f"Test pairs: {len(test_pairs)}")
     print(f"Sequence features: {tuple(seq_features.shape)}")
+    print(
+        "Ablation switches: "
+        f"MST={cfg.use_mst}, "
+        f"LightGNN={cfg.use_light_gnn}, "
+        f"CE={cfg.use_cross_modal_enhancement}, "
+        f"AL={cfg.do_active_learning}"
+    )
 
     model = build_model(cfg, total_nodes=total_nodes).to(device)
     optimizer = torch.optim.AdamW(
@@ -352,7 +403,7 @@ def main():
     )
 
     best_hits1 = -1.0
-    best_path = os.path.join(cfg.save_dir, f"best_model_{cfg.pair}.pt")
+    best_path = os.path.join(cfg.save_dir, f"best_model_{cfg.pair}_{cfg.experiment_tag}.pt")
 
     # =========================
     # Stage 1: Warmup

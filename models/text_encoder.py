@@ -98,3 +98,30 @@ class MultiScaleTransformerEncoder(nn.Module):
         out = self.out_proj(fused)
         out = F.normalize(out, p=2, dim=-1)
         return out
+
+
+class SimpleTextEncoder(nn.Module):
+    """
+    用于 w/o MST 的轻量语义基线：
+    仅做输入投影 + masked mean pooling。
+    """
+
+    def __init__(self, in_dim: int = 300, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.pool = MaskedMeanPooling()
+
+    @staticmethod
+    def build_mask(seq_x: torch.Tensor) -> torch.Tensor:
+        return (seq_x.abs().sum(dim=-1) > 0).long()
+
+    def forward(self, seq_x: torch.Tensor) -> torch.Tensor:
+        mask = self.build_mask(seq_x)
+        x = self.input_proj(seq_x)
+        out = self.pool(x, mask)
+        return F.normalize(out, p=2, dim=-1)
