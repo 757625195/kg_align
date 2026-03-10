@@ -58,8 +58,6 @@ class Config:
     # =========================
     lambda_struct: float = 0.2
     lambda_sem: float = 0.2
-    lambda_branch_align: float = 0.5
-    lambda_cross_modal: float = 0.2
     lambda_neg: float = 0.2
 
     temperature: float = 0.07
@@ -187,8 +185,6 @@ def train_one_epoch(
     total_align = 0.0
     total_struct = 0.0
     total_sem = 0.0
-    total_branch = 0.0
-    total_cross_modal = 0.0
     total_neg = 0.0
     num_batches = 0
 
@@ -293,8 +289,6 @@ def train_one_epoch(
             right_outputs=right_out,
             lambda_struct=cfg.lambda_struct,
             lambda_sem=cfg.lambda_sem,
-            lambda_branch_align=cfg.lambda_branch_align,
-            lambda_cross_modal=cfg.lambda_cross_modal,
             lambda_neg=cfg.lambda_neg,
             temperature=cfg.temperature,
             neg_left_joint=neg_left_joint,
@@ -312,8 +306,6 @@ def train_one_epoch(
         total_align += loss_dict["align_loss"].item()
         total_struct += loss_dict["struct_loss"].item()
         total_sem += loss_dict["sem_loss"].item()
-        total_branch += loss_dict["branch_align_loss"].item()
-        total_cross_modal += loss_dict["cross_modal_loss"].item()
         total_neg += loss_dict["neg_loss"].item()
         num_batches += 1
 
@@ -322,8 +314,6 @@ def train_one_epoch(
         "align_loss": total_align / max(1, num_batches),
         "struct_loss": total_struct / max(1, num_batches),
         "sem_loss": total_sem / max(1, num_batches),
-        "branch_align_loss": total_branch / max(1, num_batches),
-        "cross_modal_loss": total_cross_modal / max(1, num_batches),
         "neg_loss": total_neg / max(1, num_batches),
     }
 
@@ -441,10 +431,8 @@ def main():
             f"[Joint ] Epoch {epoch:03d} | "
             f"Loss: {train_stats['loss']:.4f} | "
             f"Align: {train_stats['align_loss']:.4f} | "
-            f"Branch: {train_stats['branch_align_loss']:.4f} | "
             f"Struct: {train_stats['struct_loss']:.4f} | "
             f"Sem: {train_stats['sem_loss']:.4f} | "
-            f"Cross: {train_stats['cross_modal_loss']:.4f} | "
             f"Neg: {train_stats['neg_loss']:.4f} | "
             f"Hits@1: {metrics['Hits@1']:.4f} | "
             f"Hits@10: {metrics['Hits@10']:.4f} | "

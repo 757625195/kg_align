@@ -73,15 +73,6 @@ def semantic_consistency_loss(
     return 1.0 - (z_sem * z_joint).sum(dim=-1).mean()
 
 
-def branch_consistency_loss(
-    z_struct_shared: torch.Tensor,
-    z_sem_shared: torch.Tensor,
-) -> torch.Tensor:
-    z_struct_shared = F.normalize(z_struct_shared, p=2, dim=-1)
-    z_sem_shared = F.normalize(z_sem_shared, p=2, dim=-1)
-    return 1.0 - (z_struct_shared * z_sem_shared).sum(dim=-1).mean()
-
-
 def structural_self_supervised_loss(z_struct: torch.Tensor) -> torch.Tensor:
     """
     warmup 阶段占位版结构自监督
@@ -97,8 +88,6 @@ def total_loss(
     right_outputs: dict,
     lambda_struct: float = 0.2,
     lambda_sem: float = 0.2,
-    lambda_branch_align: float = 0.5,
-    lambda_cross_modal: float = 0.2,
     lambda_neg: float = 0.2,
     temperature: float = 0.07,
     neg_left_joint: torch.Tensor = None,
@@ -131,8 +120,6 @@ def total_loss(
             "align_loss": zero,
             "struct_loss": struct_loss,
             "sem_loss": zero,
-            "branch_align_loss": zero,
-            "cross_modal_loss": zero,
             "neg_loss": zero,
         }
 
@@ -145,32 +132,14 @@ def total_loss(
         temperature=temperature
     )
 
-    branch_align = 0.5 * (
-        info_nce_loss(
-            left_outputs["z_struct_shared"],
-            right_outputs["z_struct_shared"],
-            temperature=temperature,
-        ) +
-        info_nce_loss(
-            left_outputs["z_sem_shared"],
-            right_outputs["z_sem_shared"],
-            temperature=temperature,
-        )
-    )
-
     struct_reg = 0.5 * (
-        structure_consistency_loss(left_outputs["z_struct_shared"], left_outputs["z_joint"]) +
-        structure_consistency_loss(right_outputs["z_struct_shared"], right_outputs["z_joint"])
+        structure_consistency_loss(left_outputs["z_struct"], left_outputs["z_joint"]) +
+        structure_consistency_loss(right_outputs["z_struct"], right_outputs["z_joint"])
     )
 
     sem_reg = 0.5 * (
-        semantic_consistency_loss(left_outputs["z_sem_shared"], left_outputs["z_joint"]) +
-        semantic_consistency_loss(right_outputs["z_sem_shared"], right_outputs["z_joint"])
-    )
-
-    cross_modal = 0.5 * (
-        branch_consistency_loss(left_outputs["z_struct_shared"], left_outputs["z_sem_shared"]) +
-        branch_consistency_loss(right_outputs["z_struct_shared"], right_outputs["z_sem_shared"])
+        semantic_consistency_loss(left_outputs["z_sem"], left_outputs["z_joint"]) +
+        semantic_consistency_loss(right_outputs["z_sem"], right_outputs["z_joint"])
     )
 
     neg_loss = margin_based_negative_loss(
@@ -182,21 +151,12 @@ def total_loss(
         hard_weight=hard_negative_weight,
     )
 
-    loss = (
-        align +
-        lambda_branch_align * branch_align +
-        lambda_struct * struct_reg +
-        lambda_sem * sem_reg +
-        lambda_cross_modal * cross_modal +
-        lambda_neg * neg_loss
-    )
+    loss = align + lambda_struct * struct_reg + lambda_sem * sem_reg + lambda_neg * neg_loss
 
     return {
         "loss": loss,
         "align_loss": align,
         "struct_loss": struct_reg,
         "sem_loss": sem_reg,
-        "branch_align_loss": branch_align,
-        "cross_modal_loss": cross_modal,
         "neg_loss": neg_loss,
     }

@@ -61,8 +61,6 @@ def main():
     score_matrix = model.score_pairs(left_out["z_joint"], right_out["z_joint"])
 
     print("z_struct:", left_out["z_struct"].shape)
-    print("z_struct_shared:", left_out["z_struct_shared"].shape)
-    print("z_sem_shared:", left_out["z_sem_shared"].shape)
     print("z_sem_enhanced:", left_out["z_sem_enhanced"].shape)
     print("z_joint:", left_out["z_joint"].shape)
     print("score_matrix:", score_matrix.shape)

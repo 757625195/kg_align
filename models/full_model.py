@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .gnn_encoder import LightweightGNNEncoder
 from .text_encoder import MultiScaleTransformerEncoder
@@ -49,19 +48,6 @@ class JointEAModel(nn.Module):
             dropout=dropout,
         )
 
-        self.struct_projector = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim, fusion_dim),
-        )
-        self.sem_projector = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim, fusion_dim),
-        )
-
         self.align_head = AlignmentHead()
 
     def encode_structure_all(self, edge_index: torch.Tensor) -> torch.Tensor:
@@ -75,10 +61,6 @@ class JointEAModel(nn.Module):
     def score_pairs(self, left_emb: torch.Tensor, right_emb: torch.Tensor) -> torch.Tensor:
         return self.align_head(left_emb, right_emb)
 
-    @staticmethod
-    def to_shared_space(projector: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(projector(x), p=2, dim=-1)
-
     def forward(
         self,
         node_ids: torch.Tensor,       # [B]
@@ -89,18 +71,15 @@ class JointEAModel(nn.Module):
     ):
         z_struct_all = self.encode_structure_all(edge_index)    # [N, D]
 
-        z_struct = z_struct_all[node_ids]                      # [B, D]
+        z_struct = z_struct_all[node_ids]                       # [B, D]
         z_neighbor = z_struct_all[neighbor_ids]                # [B, K, D]
 
         z_sem = self.encode_semantics(seq_features)            # [B, D]
-        z_struct_shared = self.to_shared_space(self.struct_projector, z_struct)
-        z_sem_shared = self.to_shared_space(self.sem_projector, z_sem)
-        z_neighbor_shared = self.to_shared_space(self.struct_projector, z_neighbor)
 
         fusion_out = self.fusion(
-            s=z_sem_shared,
-            t_self=z_struct_shared,
-            t_nei=z_neighbor_shared,
+            s=z_sem,
+            t_self=z_struct,
+            t_nei=z_neighbor,
             nei_mask=neighbor_mask,
             return_components=True,
         )
@@ -108,8 +87,6 @@ class JointEAModel(nn.Module):
         return {
             "z_struct": z_struct,
             "z_sem": z_sem,
-            "z_struct_shared": z_struct_shared,
-            "z_sem_shared": z_sem_shared,
             "z_joint": fusion_out["z_joint"],
             "z_sem_enhanced": fusion_out["z_sem_enhanced"],
             "z_struct_enhanced": fusion_out["z_struct_enhanced"],
