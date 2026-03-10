@@ -1,0 +1,135 @@
+from typing import List, Tuple, Dict
+
+import torch
+import torch.nn.functional as F
+
+from graph_utils import sample_neighbors
+
+
+@torch.no_grad()
+def encode_entity_outputs(
+    model,
+    node_ids: torch.Tensor,
+    edge_index: torch.Tensor,
+    seq_features: torch.Tensor,
+    adj_list: Dict[int, list],
+    num_neighbors: int,
+    batch_size: int,
+    device: torch.device,
+):
+    model.eval()
+    outputs = {}
+
+    for start in range(0, len(node_ids), batch_size):
+        batch_ids = node_ids[start:start + batch_size].to(device)
+        batch_seq = seq_features[batch_ids.cpu()].to(device)
+
+        neighbor_ids, neighbor_mask = sample_neighbors(
+            node_ids=batch_ids,
+            adj_list=adj_list,
+            num_neighbors=num_neighbors,
+            device=device,
+        )
+
+        out = model(
+            node_ids=batch_ids,
+            edge_index=edge_index,
+            seq_features=batch_seq,
+            neighbor_ids=neighbor_ids,
+            neighbor_mask=neighbor_mask,
+        )
+        for key, value in out.items():
+            if not torch.is_tensor(value):
+                continue
+            outputs.setdefault(key, []).append(value.detach().cpu())
+
+    return {
+        key: torch.cat(chunks, dim=0)
+        for key, chunks in outputs.items()
+    }
+
+
+@torch.no_grad()
+def encode_entities(
+    model,
+    node_ids: torch.Tensor,
+    edge_index: torch.Tensor,
+    seq_features: torch.Tensor,
+    adj_list: Dict[int, list],
+    num_neighbors: int,
+    batch_size: int,
+    device: torch.device,
+    output_key: str = "z_joint",
+):
+    outputs = encode_entity_outputs(
+        model=model,
+        node_ids=node_ids,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        device=device,
+    )
+    return outputs[output_key]
+
+
+@torch.no_grad()
+def compute_metrics_from_similarity(
+    sim: torch.Tensor,
+    gt_index: torch.Tensor,
+    ks=(1, 10)
+):
+    gt_score = sim[torch.arange(sim.size(0)), gt_index].unsqueeze(1)
+    ranks = (sim > gt_score).sum(dim=1) + 1
+
+    metrics = {}
+    for k in ks:
+        metrics[f"Hits@{k}"] = (ranks <= k).float().mean().item()
+    metrics["MRR"] = (1.0 / ranks.float()).mean().item()
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_alignment(
+    model,
+    edge_index: torch.Tensor,
+    seq_features: torch.Tensor,
+    adj_list,
+    num_neighbors: int,
+    test_pairs: List[Tuple[int, int]],
+    batch_size: int,
+    device: torch.device,
+):
+    left_ids = torch.tensor([l for l, _ in test_pairs], dtype=torch.long)
+    right_ids = torch.tensor([r for _, r in test_pairs], dtype=torch.long)
+
+    left_emb = encode_entities(
+        model=model,
+        node_ids=left_ids,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    right_emb = encode_entities(
+        model=model,
+        node_ids=right_ids,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    left_emb = F.normalize(left_emb, p=2, dim=-1)
+    right_emb = F.normalize(right_emb, p=2, dim=-1)
+
+    sim = model.score_pairs(left_emb, right_emb).cpu()
+    gt = torch.arange(sim.size(0), dtype=torch.long)
+
+    return compute_metrics_from_similarity(sim, gt)
