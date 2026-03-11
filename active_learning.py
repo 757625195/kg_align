@@ -95,11 +95,15 @@ def select_active_learning_candidates(
     right_outputs: dict,
     known_pairs: Set[Tuple[int, int]],
     budget: int = 100,
-    alpha_uncertainty: float = 0.6,
-    alpha_repr: float = 0.4,
+    alpha_uncertainty: float = 0.35,
+    alpha_repr: float = 0.65,
 ):
     sim = model.score_pairs(left_outputs["z_joint"], right_outputs["z_joint"]).cpu()
+    sim_rl = sim.t()
     pred_j = sim.argmax(dim=-1)
+    pred_i = sim_rl.argmax(dim=-1)
+    stats_lr = model.align_head.pair_confidence(sim)
+    stats_rl = model.align_head.pair_confidence(sim_rl)
 
     unc = bidirectional_uncertainty(
         model=model,
@@ -120,10 +124,23 @@ def select_active_learning_candidates(
 
     for i in rank_idx:
         l = int(left_ids[i].item())
-        r = int(right_ids[pred_j[i]].item())
+        matched_j = int(pred_j[i].item())
+        r = int(right_ids[matched_j].item())
         if (l, r) in known_pairs:
             continue
-        candidates.append((l, r))
+        reciprocal = int(pred_i[matched_j].item()) == i
+        candidates.append({
+            "pair": (l, r),
+            "left_index": i,
+            "right_index": matched_j,
+            "score": float(final_score[i].item()),
+            "uncertainty": float(unc[i].item()),
+            "confidence_lr": float(stats_lr["confidence"][i].item()),
+            "confidence_rl": float(stats_rl["confidence"][matched_j].item()),
+            "margin_lr": float(stats_lr["margin"][i].item()),
+            "margin_rl": float(stats_rl["margin"][matched_j].item()),
+            "reciprocal": reciprocal,
+        })
         kept_rank_positions.append(i)
         if len(candidates) >= budget * 3:
             break
@@ -141,11 +158,57 @@ def select_active_learning_candidates(
     return [candidates[i] for i in selected_local]
 
 
-def simulate_human_annotation(candidate_pairs, gold_test_pairs):
+def filter_active_learning_candidates(
+    candidates,
+    min_confidence: float,
+    min_margin: float,
+    min_uncertainty: float,
+    max_uncertainty: float,
+    require_bidirectional: bool,
+):
+    filtered = []
+    rejected = {
+        "bidirectional": 0,
+        "confidence": 0,
+        "margin": 0,
+        "low_uncertainty": 0,
+        "uncertainty": 0,
+    }
+
+    for item in candidates:
+        if require_bidirectional and not item["reciprocal"]:
+            rejected["bidirectional"] += 1
+            continue
+
+        confidence = min(item["confidence_lr"], item["confidence_rl"])
+        if confidence < min_confidence:
+            rejected["confidence"] += 1
+            continue
+
+        margin = min(item["margin_lr"], item["margin_rl"])
+        if margin < min_margin:
+            rejected["margin"] += 1
+            continue
+
+        if item["uncertainty"] < min_uncertainty:
+            rejected["low_uncertainty"] += 1
+            continue
+
+        if item["uncertainty"] > max_uncertainty:
+            rejected["uncertainty"] += 1
+            continue
+
+        filtered.append(item)
+
+    return filtered, rejected
+
+
+def simulate_human_annotation(candidate_items, gold_test_pairs):
     new_positive = []
     new_negative = []
 
-    for p in candidate_pairs:
+    for item in candidate_items:
+        p = item["pair"]
         if p in gold_test_pairs:
             new_positive.append(p)
         else:
@@ -204,7 +267,18 @@ def run_active_learning_round(
         budget=cfg.al_budget,
     )
 
-    new_pos, new_neg = simulate_human_annotation(candidates, gold_test_pairs)
+    filtered_candidates, rejected = filter_active_learning_candidates(
+        candidates=candidates,
+        min_confidence=cfg.al_min_confidence,
+        min_margin=cfg.al_min_margin,
+        min_uncertainty=cfg.al_min_uncertainty,
+        max_uncertainty=cfg.al_max_uncertainty,
+        require_bidirectional=cfg.al_require_bidirectional,
+    )
+
+    filtered_candidates = filtered_candidates[:cfg.al_budget]
+
+    new_pos, new_neg = simulate_human_annotation(filtered_candidates, gold_test_pairs)
 
     added = 0
     for p in new_pos:
@@ -215,7 +289,13 @@ def run_active_learning_round(
 
     return {
         "candidates": len(candidates),
+        "filtered_candidates": len(filtered_candidates),
         "new_positive": len(new_pos),
         "new_negative": len(new_neg),
         "added_to_train": added,
+        "rejected_bidirectional": rejected["bidirectional"],
+        "rejected_confidence": rejected["confidence"],
+        "rejected_margin": rejected["margin"],
+        "rejected_low_uncertainty": rejected["low_uncertainty"],
+        "rejected_uncertainty": rejected["uncertainty"],
     }

@@ -8,10 +8,10 @@ from torch.utils.data import DataLoader
 
 from data_utils import load_dbp15k_from_pyg
 from dataset import AlignmentTrainDataset, collate_alignment_batch
-from evaluate import evaluate_alignment
+from evaluate import evaluate_alignment, encode_entity_outputs
 from models.full_model import JointEAModel
 from models.losses import total_loss
-from sampler import random_negative_sampling, hard_negative_sampling
+from sampler import random_negative_sampling, hard_negative_sampling, queue_hard_negative_sampling
 from active_learning import run_active_learning_round
 from graph_utils import build_adj_list, sample_neighbors
 
@@ -46,6 +46,8 @@ class Config:
     text_hidden_dim: int = 128
     fusion_dim: int = 128
     gnn_layers: int = 2
+    gnn_share_parameters: bool = False
+    gnn_use_depthwise_separable: bool = False
     text_heads: int = 4
     text_layers: int = 2
     dropout: float = 0.1
@@ -64,9 +66,19 @@ class Config:
     # =========================
     # Loss
     # =========================
+    lambda_branch_align: float = 0.15
+    lambda_cross_modal: float = 0.03
+    lambda_joint_branch: float = 0.00
     lambda_struct: float = 0.2
     lambda_sem: float = 0.2
     lambda_neg: float = 0.2
+    lambda_topology: float = 0.00
+    branch_align_start: float = 0.15
+    branch_align_end: float = 0.50
+    cross_modal_start: float = 0.25
+    cross_modal_end: float = 0.65
+    joint_branch_start: float = 0.40
+    joint_branch_end: float = 0.80
 
     temperature: float = 0.07
     margin: float = 0.2
@@ -78,20 +90,33 @@ class Config:
     num_random_neg: int = 1
     num_hard_neg: int = 1
     hard_topk: int = 5
+    num_global_hard_neg: int = 1
+    global_hard_topk: int = 10
+    global_hard_topk_max: int = 25
+    use_global_hard_neg: bool = True
+    num_conflict_neg: int = 0
+    memory_bank_epochs: int = 2
 
     # =========================
     # Active Learning
     # =========================
-    do_active_learning: bool = False
+    do_active_learning: bool = True
     al_rounds: int = 3
     al_budget: int = 100
     al_every_epochs: int = 5
+    al_require_bidirectional: bool = False
+    al_min_confidence: float = 0.20
+    al_min_margin: float = 0.02
+    al_min_uncertainty: float = 0.00
+    al_max_uncertainty: float = 0.85
 
     # =========================
     # Misc
     # =========================
     seed: int = 42
     save_dir: str = "outputs"
+    early_stop_patience: int = 4
+    early_stop_min_delta: float = 1e-3
 
     @property
     def experiment_tag(self) -> str:
@@ -104,6 +129,10 @@ class Config:
             disabled.append("w_o_CE")
         if not self.do_active_learning:
             disabled.append("w_o_AL")
+        if self.gnn_share_parameters:
+            disabled.append("shared_gnn")
+        if self.gnn_use_depthwise_separable:
+            disabled.append("dwsep_gnn")
         return "full_model" if not disabled else "_".join(disabled)
 
 
@@ -140,12 +169,15 @@ def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
         text_hidden_dim=cfg.text_hidden_dim,
         fusion_dim=cfg.fusion_dim,
         gnn_layers=cfg.gnn_layers,
+        gnn_share_parameters=cfg.gnn_share_parameters,
+        gnn_use_depthwise_separable=cfg.gnn_use_depthwise_separable,
         text_heads=cfg.text_heads,
         text_layers=cfg.text_layers,
         dropout=cfg.dropout,
         use_mst=cfg.use_mst,
         use_light_gnn=cfg.use_light_gnn,
         use_cross_modal_enhancement=cfg.use_cross_modal_enhancement,
+        use_explicit_topology_matching=True,
     )
 
 
@@ -205,6 +237,66 @@ def forward_entities(
     return out
 
 
+@torch.no_grad()
+def build_global_negative_cache(
+    model: JointEAModel,
+    edge_index: torch.Tensor,
+    seq_features: torch.Tensor,
+    adj_list: Dict[int, List[int]],
+    train_pairs: List[Tuple[int, int]],
+    cfg: Config,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    left_ids = torch.tensor(sorted({l for l, _ in train_pairs}), dtype=torch.long)
+    right_ids = torch.tensor(sorted({r for _, r in train_pairs}), dtype=torch.long)
+
+    left_outputs = encode_entity_outputs(
+        model=model,
+        node_ids=left_ids,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=cfg.num_neighbors,
+        batch_size=cfg.eval_batch_size,
+        device=device,
+    )
+    right_outputs = encode_entity_outputs(
+        model=model,
+        node_ids=right_ids,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=cfg.num_neighbors,
+        batch_size=cfg.eval_batch_size,
+        device=device,
+    )
+
+    return {
+        "left_ids": left_ids,
+        "right_ids": right_ids,
+        "left_joint": left_outputs["z_joint"],
+        "right_joint": right_outputs["z_joint"],
+        "left_struct": left_outputs["z_struct"],
+        "right_struct": right_outputs["z_struct"],
+        "left_sem": left_outputs["z_sem"],
+        "right_sem": right_outputs["z_sem"],
+    }
+
+
+def merge_negative_banks(history: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    merged = {}
+    for key in history[0]:
+        merged[key] = torch.cat([entry[key] for entry in history], dim=0)
+    return merged
+
+
+def get_dynamic_topk(epoch: int, total_epochs: int, base_topk: int, max_topk: int) -> int:
+    if total_epochs <= 1:
+        return base_topk
+    ratio = (epoch - 1) / max(1, total_epochs - 1)
+    return int(round(base_topk + (max_topk - base_topk) * ratio))
+
+
 def train_one_epoch(
     model: JointEAModel,
     loader: DataLoader,
@@ -215,6 +307,10 @@ def train_one_epoch(
     cfg: Config,
     device: torch.device,
     all_train_pairs: List[Tuple[int, int]],
+    negative_bank: Dict[str, torch.Tensor] = None,
+    dynamic_global_topk: int = None,
+    current_joint_epoch: int = 1,
+    total_joint_epochs: int = 1,
     warmup_mode: bool = False,
 ) -> Dict[str, float]:
     model.train()
@@ -225,9 +321,16 @@ def train_one_epoch(
 
     total = 0.0
     total_align = 0.0
+    total_branch_align = 0.0
+    total_cross_modal = 0.0
+    total_joint_branch = 0.0
+    total_branch_scale = 0.0
+    total_cross_scale = 0.0
+    total_joint_scale = 0.0
     total_struct = 0.0
     total_sem = 0.0
     total_neg = 0.0
+    total_topology = 0.0
     num_batches = 0
 
     for batch in loader:
@@ -288,7 +391,22 @@ def train_one_epoch(
                 num_hard_neg=cfg.num_hard_neg,
             )
 
-            all_negs = rand_negs + hard_negs
+            global_hard_negs = []
+            if cfg.use_global_hard_neg and negative_bank is not None:
+                global_hard_negs = queue_hard_negative_sampling(
+                    batch_pairs=batch_pairs,
+                    batch_left_ids=left_id,
+                    batch_right_ids=right_id,
+                    batch_left_outputs=left_out,
+                    batch_right_outputs=right_out,
+                    bank=negative_bank,
+                    known_pairs=known_pair_set,
+                    joint_topk=dynamic_global_topk or cfg.global_hard_topk,
+                    num_global_hard_neg=cfg.num_global_hard_neg,
+                    num_conflict_neg=cfg.num_conflict_neg,
+                )
+
+            all_negs = rand_negs + hard_negs + global_hard_negs
 
             if len(all_negs) > 0:
                 neg_left_ids = torch.tensor(
@@ -329,9 +447,21 @@ def train_one_epoch(
         loss_dict = total_loss(
             left_outputs=left_out,
             right_outputs=right_out,
+            lambda_branch_align=cfg.lambda_branch_align,
+            lambda_cross_modal=cfg.lambda_cross_modal,
+            lambda_joint_branch=cfg.lambda_joint_branch,
             lambda_struct=cfg.lambda_struct,
             lambda_sem=cfg.lambda_sem,
             lambda_neg=cfg.lambda_neg,
+            lambda_topology=cfg.lambda_topology,
+            current_joint_epoch=current_joint_epoch,
+            total_joint_epochs=total_joint_epochs,
+            branch_align_start=cfg.branch_align_start,
+            branch_align_end=cfg.branch_align_end,
+            cross_modal_start=cfg.cross_modal_start,
+            cross_modal_end=cfg.cross_modal_end,
+            joint_branch_start=cfg.joint_branch_start,
+            joint_branch_end=cfg.joint_branch_end,
             temperature=cfg.temperature,
             neg_left_joint=neg_left_joint,
             neg_right_joint=neg_right_joint,
@@ -346,17 +476,31 @@ def train_one_epoch(
 
         total += loss_dict["loss"].item()
         total_align += loss_dict["align_loss"].item()
+        total_branch_align += loss_dict["branch_align_loss"].item()
+        total_cross_modal += loss_dict["cross_modal_loss"].item()
+        total_joint_branch += loss_dict["joint_branch_loss"].item()
+        total_branch_scale += loss_dict["branch_align_scale"].item()
+        total_cross_scale += loss_dict["cross_modal_scale"].item()
+        total_joint_scale += loss_dict["joint_branch_scale"].item()
         total_struct += loss_dict["struct_loss"].item()
         total_sem += loss_dict["sem_loss"].item()
         total_neg += loss_dict["neg_loss"].item()
+        total_topology += loss_dict["topology_loss"].item()
         num_batches += 1
 
     return {
         "loss": total / max(1, num_batches),
         "align_loss": total_align / max(1, num_batches),
+        "branch_align_loss": total_branch_align / max(1, num_batches),
+        "cross_modal_loss": total_cross_modal / max(1, num_batches),
+        "joint_branch_loss": total_joint_branch / max(1, num_batches),
+        "branch_align_scale": total_branch_scale / max(1, num_batches),
+        "cross_modal_scale": total_cross_scale / max(1, num_batches),
+        "joint_branch_scale": total_joint_scale / max(1, num_batches),
         "struct_loss": total_struct / max(1, num_batches),
         "sem_loss": total_sem / max(1, num_batches),
         "neg_loss": total_neg / max(1, num_batches),
+        "topology_loss": total_topology / max(1, num_batches),
     }
 
 
@@ -393,6 +537,36 @@ def main():
         f"LightGNN={cfg.use_light_gnn}, "
         f"CE={cfg.use_cross_modal_enhancement}, "
         f"AL={cfg.do_active_learning}"
+    )
+    print(
+        "Negative sampling: "
+        f"random={cfg.num_random_neg}, "
+        f"batch_hard={cfg.num_hard_neg}, "
+        f"global_hard={cfg.num_global_hard_neg}, "
+        f"conflict={cfg.num_conflict_neg}, "
+        f"global_topk={cfg.global_hard_topk}->{cfg.global_hard_topk_max}, "
+        f"bank_epochs={cfg.memory_bank_epochs}, "
+        f"use_global_hard={cfg.use_global_hard_neg}"
+    )
+    print(
+        "Collaborative loss schedule: "
+        f"branch={cfg.lambda_branch_align} [{cfg.branch_align_start:.2f},{cfg.branch_align_end:.2f}], "
+        f"cross={cfg.lambda_cross_modal} [{cfg.cross_modal_start:.2f},{cfg.cross_modal_end:.2f}], "
+        f"joint_branch={cfg.lambda_joint_branch} [{cfg.joint_branch_start:.2f},{cfg.joint_branch_end:.2f}], "
+        f"topology={cfg.lambda_topology:.2f}"
+    )
+    print(
+        "Structural encoder switches: "
+        f"shared_gnn={cfg.gnn_share_parameters}, "
+        f"depthwise_separable={cfg.gnn_use_depthwise_separable}"
+    )
+    print(
+        "Active learning filters: "
+        f"bidirectional={cfg.al_require_bidirectional}, "
+        f"min_conf={cfg.al_min_confidence:.2f}, "
+        f"min_margin={cfg.al_min_margin:.2f}, "
+        f"min_unc={cfg.al_min_uncertainty:.2f}, "
+        f"max_unc={cfg.al_max_uncertainty:.2f}"
     )
 
     model = build_model(cfg, total_nodes=total_nodes).to(device)
@@ -440,6 +614,7 @@ def main():
             f"[Warmup] Epoch {epoch:03d} | "
             f"Loss: {train_stats['loss']:.4f} | "
             f"Struct: {train_stats['struct_loss']:.4f} | "
+            f"Topo: {train_stats['topology_loss']:.4f} | "
             f"Hits@1: {metrics['Hits@1']:.4f} | "
             f"Hits@10: {metrics['Hits@10']:.4f} | "
             f"MRR: {metrics['MRR']:.4f}"
@@ -450,9 +625,31 @@ def main():
     # =========================
     print("\n===== Stage 2: Joint Training =====")
     al_round_done = 0
+    negative_bank_history = []
+    early_stop_counter = 0
 
     for epoch in range(1, cfg.joint_epochs + 1):
         train_loader = make_loader(train_pairs, cfg.batch_size, shuffle=True)
+        negative_bank = None
+        dynamic_global_topk = get_dynamic_topk(
+            epoch=epoch,
+            total_epochs=cfg.joint_epochs,
+            base_topk=cfg.global_hard_topk,
+            max_topk=cfg.global_hard_topk_max,
+        )
+        if cfg.use_global_hard_neg:
+            current_bank = build_global_negative_cache(
+                model=model,
+                edge_index=edge_index,
+                seq_features=seq_features,
+                adj_list=adj_list,
+                train_pairs=train_pairs,
+                cfg=cfg,
+                device=device,
+            )
+            negative_bank_history.append(current_bank)
+            negative_bank_history = negative_bank_history[-cfg.memory_bank_epochs:]
+            negative_bank = merge_negative_banks(negative_bank_history)
 
         train_stats = train_one_epoch(
             model=model,
@@ -464,6 +661,10 @@ def main():
             cfg=cfg,
             device=device,
             all_train_pairs=train_pairs,
+            negative_bank=negative_bank,
+            dynamic_global_topk=dynamic_global_topk,
+            current_joint_epoch=epoch,
+            total_joint_epochs=cfg.joint_epochs,
             warmup_mode=False,
         )
 
@@ -482,16 +683,22 @@ def main():
             f"[Joint ] Epoch {epoch:03d} | "
             f"Loss: {train_stats['loss']:.4f} | "
             f"Align: {train_stats['align_loss']:.4f} | "
+            f"Branch: {train_stats['branch_align_loss']:.4f}({train_stats['branch_align_scale']:.2f}) | "
+            f"Cross: {train_stats['cross_modal_loss']:.4f}({train_stats['cross_modal_scale']:.2f}) | "
+            f"JointBr: {train_stats['joint_branch_loss']:.4f}({train_stats['joint_branch_scale']:.2f}) | "
             f"Struct: {train_stats['struct_loss']:.4f} | "
             f"Sem: {train_stats['sem_loss']:.4f} | "
             f"Neg: {train_stats['neg_loss']:.4f} | "
+            f"Topo: {train_stats['topology_loss']:.4f} | "
+            f"TopK: {dynamic_global_topk} | "
             f"Hits@1: {metrics['Hits@1']:.4f} | "
             f"Hits@10: {metrics['Hits@10']:.4f} | "
             f"MRR: {metrics['MRR']:.4f}"
         )
 
-        if metrics["Hits@1"] > best_hits1:
+        if metrics["Hits@1"] > best_hits1 + cfg.early_stop_min_delta:
             best_hits1 = metrics["Hits@1"]
+            early_stop_counter = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -500,6 +707,15 @@ def main():
                 best_path,
             )
             print(f"Saved best model to {best_path}")
+        else:
+            early_stop_counter += 1
+
+        if early_stop_counter >= cfg.early_stop_patience:
+            print(
+                f"Early stopping triggered at joint epoch {epoch:03d} "
+                f"(best Hits@1={best_hits1:.4f})"
+            )
+            break
 
         # =========================
         # Optional Active Learning
@@ -524,9 +740,15 @@ def main():
             print(
                 f"[AL    ] Round {al_round_done:02d} | "
                 f"Candidates: {al_stats['candidates']} | "
+                f"Filtered: {al_stats['filtered_candidates']} | "
                 f"NewPos: {al_stats['new_positive']} | "
                 f"NewNeg: {al_stats['new_negative']} | "
-                f"Added: {al_stats['added_to_train']}"
+                f"Added: {al_stats['added_to_train']} | "
+                f"RejectBi: {al_stats['rejected_bidirectional']} | "
+                f"RejectConf: {al_stats['rejected_confidence']} | "
+                f"RejectMargin: {al_stats['rejected_margin']} | "
+                f"RejectLowUnc: {al_stats['rejected_low_uncertainty']} | "
+                f"RejectUnc: {al_stats['rejected_uncertainty']}"
             )
 
     print("\nTraining finished.")

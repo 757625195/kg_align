@@ -21,6 +21,14 @@ def sample_neighbors(
     num_neighbors: int,
     device: torch.device,
 ):
+    """
+    为每个节点固定采样 K 个邻居。
+
+    这里的设计目的不是显式展开完整多跳子图，而是:
+    - 控制每个 batch 的结构上下文规模，避免邻居爆炸
+    - 为后续跨模态融合提供局部结构证据
+    - 在大图上保持近似线性的邻居访问成本
+    """
     batch_ids = node_ids.detach().cpu().tolist()
 
     neigh_ids = []

@@ -21,6 +21,8 @@ def main():
         text_hidden_dim=128,
         fusion_dim=128,
         gnn_layers=2,
+        gnn_share_parameters=True,
+        gnn_use_depthwise_separable=True,
         text_heads=4,
         text_layers=2,
         dropout=0.1,
@@ -63,9 +65,12 @@ def main():
     print("z_struct:", left_out["z_struct"].shape)
     print("z_sem_enhanced:", left_out["z_sem_enhanced"].shape)
     print("z_joint:", left_out["z_joint"].shape)
+    print("z_hop2:", left_out["z_hop2"].shape)
+    print("z_hop3:", left_out["z_hop3"].shape)
     print("score_matrix:", score_matrix.shape)
     print("loss:", losses["loss"].item())
     print("align_loss:", losses["align_loss"].item())
+    print("topology_loss:", losses["topology_loss"].item())
 
 
 if __name__ == "__main__":
