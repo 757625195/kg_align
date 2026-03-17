@@ -104,6 +104,7 @@ class Config:
     al_rounds: int = 3
     al_budget: int = 100
     al_every_epochs: int = 5
+    al_seed_train_ratio: float = 0.7
     al_require_bidirectional: bool = False
     al_min_confidence: float = 0.20
     al_min_margin: float = 0.02
@@ -117,6 +118,7 @@ class Config:
     save_dir: str = "outputs"
     early_stop_patience: int = 4
     early_stop_min_delta: float = 1e-3
+    val_ratio: float = 0.2
 
     @property
     def experiment_tag(self) -> str:
@@ -295,6 +297,36 @@ def get_dynamic_topk(epoch: int, total_epochs: int, base_topk: int, max_topk: in
         return base_topk
     ratio = (epoch - 1) / max(1, total_epochs - 1)
     return int(round(base_topk + (max_topk - base_topk) * ratio))
+
+
+def split_train_pairs_for_active_learning(
+    train_pairs: List[Tuple[int, int]],
+    seed_train_ratio: float,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    if len(train_pairs) <= 1:
+        return list(train_pairs), []
+
+    shuffled = list(train_pairs)
+    random.shuffle(shuffled)
+
+    seed_count = int(round(len(shuffled) * seed_train_ratio))
+    seed_count = min(max(1, seed_count), len(shuffled) - 1)
+    return shuffled[:seed_count], shuffled[seed_count:]
+
+
+def split_eval_pairs(
+    pairs: List[Tuple[int, int]],
+    val_ratio: float,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    if len(pairs) <= 1:
+        return list(pairs), list(pairs)
+
+    shuffled = list(pairs)
+    random.shuffle(shuffled)
+
+    val_count = int(round(len(shuffled) * val_ratio))
+    val_count = min(max(1, val_count), len(shuffled) - 1)
+    return shuffled[:val_count], shuffled[val_count:]
 
 
 def train_one_epoch(
@@ -519,7 +551,18 @@ def main():
     edge_index = data["edge_index"].to(device)
     seq_features = data["seq_features"]   # 通常放 CPU
     train_pairs = list(data["train_pairs"])
-    test_pairs = list(data["test_pairs"])
+    eval_pairs = list(data["test_pairs"])
+    active_learning_oracle_pairs: List[Tuple[int, int]] = []
+    val_pairs, test_pairs = split_eval_pairs(
+        pairs=eval_pairs,
+        val_ratio=cfg.val_ratio,
+    )
+
+    if cfg.do_active_learning:
+        train_pairs, active_learning_oracle_pairs = split_train_pairs_for_active_learning(
+            train_pairs=train_pairs,
+            seed_train_ratio=cfg.al_seed_train_ratio,
+        )
 
     # 用 CPU 上的 edge_index 建邻接表，避免 GPU tensor 转 list 问题
     adj_list = build_adj_list(data["edge_index"].cpu(), total_nodes)
@@ -529,7 +572,16 @@ def main():
     print(f"Total nodes: {total_nodes}")
     print(f"Edges total: {edge_index.size(1)}")
     print(f"Train pairs: {len(train_pairs)}")
+    print(f"Validation pairs: {len(val_pairs)}")
     print(f"Test pairs: {len(test_pairs)}")
+    if cfg.do_active_learning:
+        print(
+            "Active learning split: "
+            f"seed_train={len(train_pairs)}, "
+            f"oracle_pool={len(active_learning_oracle_pairs)}, "
+            f"seed_ratio={cfg.al_seed_train_ratio:.2f}"
+        )
+    print(f"Validation split ratio: {cfg.val_ratio:.2f}")
     print(f"Sequence features: {tuple(seq_features.shape)}")
     print(
         "Ablation switches: "
@@ -605,7 +657,7 @@ def main():
             seq_features=seq_features,
             adj_list=adj_list,
             num_neighbors=cfg.num_neighbors,
-            test_pairs=test_pairs,
+            test_pairs=val_pairs,
             batch_size=cfg.eval_batch_size,
             device=device,
         )
@@ -674,7 +726,7 @@ def main():
             seq_features=seq_features,
             adj_list=adj_list,
             num_neighbors=cfg.num_neighbors,
-            test_pairs=test_pairs,
+            test_pairs=val_pairs,
             batch_size=cfg.eval_batch_size,
             device=device,
         )
@@ -722,6 +774,7 @@ def main():
         # =========================
         if (
             cfg.do_active_learning
+            and len(active_learning_oracle_pairs) > 0
             and epoch % cfg.al_every_epochs == 0
             and al_round_done < cfg.al_rounds
         ):
@@ -732,7 +785,7 @@ def main():
                 seq_features=seq_features,
                 adj_list=adj_list,
                 train_pairs=train_pairs,
-                test_pairs=test_pairs,
+                oracle_pairs=active_learning_oracle_pairs,
                 device=device,
             )
             al_round_done += 1
@@ -751,8 +804,29 @@ def main():
                 f"RejectUnc: {al_stats['rejected_uncertainty']}"
             )
 
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+    final_test_metrics = evaluate_alignment(
+        model=model,
+        edge_index=edge_index,
+        seq_features=seq_features,
+        adj_list=adj_list,
+        num_neighbors=cfg.num_neighbors,
+        test_pairs=test_pairs,
+        batch_size=cfg.eval_batch_size,
+        device=device,
+    )
+
     print("\nTraining finished.")
-    print(f"Best Hits@1: {best_hits1:.4f}")
+    print(f"Best validation Hits@1: {best_hits1:.4f}")
+    print(
+        "[Test  ] Final | "
+        f"Hits@1: {final_test_metrics['Hits@1']:.4f} | "
+        f"Hits@10: {final_test_metrics['Hits@10']:.4f} | "
+        f"MRR: {final_test_metrics['MRR']:.4f}"
+    )
 
 
 if __name__ == "__main__":

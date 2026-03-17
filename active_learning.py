@@ -203,13 +203,14 @@ def filter_active_learning_candidates(
     return filtered, rejected
 
 
-def simulate_human_annotation(candidate_items, gold_test_pairs):
+def simulate_human_annotation(candidate_items, oracle_pairs):
     new_positive = []
     new_negative = []
+    oracle_pair_set = set(oracle_pairs)
 
     for item in candidate_items:
         p = item["pair"]
-        if p in gold_test_pairs:
+        if p in oracle_pair_set:
             new_positive.append(p)
         else:
             new_negative.append(p)
@@ -225,16 +226,29 @@ def run_active_learning_round(
     seq_features,
     adj_list,
     train_pairs,
-    test_pairs,
+    oracle_pairs,
     device,
 ):
     model.eval()
 
     known_pairs = set(train_pairs)
-    gold_test_pairs = set(test_pairs)
+    if len(oracle_pairs) == 0:
+        return {
+            "candidates": 0,
+            "filtered_candidates": 0,
+            "new_positive": 0,
+            "new_negative": 0,
+            "added_to_train": 0,
+            "remaining_oracle": 0,
+            "rejected_bidirectional": 0,
+            "rejected_confidence": 0,
+            "rejected_margin": 0,
+            "rejected_low_uncertainty": 0,
+            "rejected_uncertainty": 0,
+        }
 
-    left_ids = torch.tensor(sorted({l for l, _ in test_pairs}), dtype=torch.long)
-    right_ids = torch.tensor(sorted({r for _, r in test_pairs}), dtype=torch.long)
+    left_ids = torch.tensor(sorted({l for l, _ in oracle_pairs}), dtype=torch.long)
+    right_ids = torch.tensor(sorted({r for _, r in oracle_pairs}), dtype=torch.long)
 
     left_outputs = encode_entity_outputs(
         model=model,
@@ -278,7 +292,7 @@ def run_active_learning_round(
 
     filtered_candidates = filtered_candidates[:cfg.al_budget]
 
-    new_pos, new_neg = simulate_human_annotation(filtered_candidates, gold_test_pairs)
+    new_pos, new_neg = simulate_human_annotation(filtered_candidates, oracle_pairs)
 
     added = 0
     for p in new_pos:
@@ -287,12 +301,17 @@ def run_active_learning_round(
             known_pairs.add(p)
             added += 1
 
+    if added > 0:
+        promoted = set(new_pos)
+        oracle_pairs[:] = [pair for pair in oracle_pairs if pair not in promoted]
+
     return {
         "candidates": len(candidates),
         "filtered_candidates": len(filtered_candidates),
         "new_positive": len(new_pos),
         "new_negative": len(new_neg),
         "added_to_train": added,
+        "remaining_oracle": len(oracle_pairs),
         "rejected_bidirectional": rejected["bidirectional"],
         "rejected_confidence": rejected["confidence"],
         "rejected_margin": rejected["margin"],
