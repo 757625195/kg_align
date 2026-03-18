@@ -94,6 +94,7 @@ def select_active_learning_candidates(
     left_outputs: dict,
     right_outputs: dict,
     known_pairs: Set[Tuple[int, int]],
+    queried_pairs: Set[Tuple[int, int]],
     budget: int = 100,
     alpha_uncertainty: float = 0.35,
     alpha_repr: float = 0.65,
@@ -126,7 +127,7 @@ def select_active_learning_candidates(
         l = int(left_ids[i].item())
         matched_j = int(pred_j[i].item())
         r = int(right_ids[matched_j].item())
-        if (l, r) in known_pairs:
+        if (l, r) in known_pairs or (l, r) in queried_pairs:
             continue
         reciprocal = int(pred_i[matched_j].item()) == i
         candidates.append({
@@ -203,13 +204,13 @@ def filter_active_learning_candidates(
     return filtered, rejected
 
 
-def simulate_human_annotation(candidate_items, gold_test_pairs):
+def simulate_human_annotation(candidate_items, gold_pool_pairs):
     new_positive = []
     new_negative = []
 
     for item in candidate_items:
         p = item["pair"]
-        if p in gold_test_pairs:
+        if p in gold_pool_pairs:
             new_positive.append(p)
         else:
             new_negative.append(p)
@@ -225,16 +226,32 @@ def run_active_learning_round(
     seq_features,
     adj_list,
     train_pairs,
-    test_pairs,
+    pool_pairs,
+    queried_pairs,
     device,
 ):
     model.eval()
 
     known_pairs = set(train_pairs)
-    gold_test_pairs = set(test_pairs)
+    gold_pool_pairs = set(pool_pairs)
 
-    left_ids = torch.tensor(sorted({l for l, _ in test_pairs}), dtype=torch.long)
-    right_ids = torch.tensor(sorted({r for _, r in test_pairs}), dtype=torch.long)
+    if len(pool_pairs) == 0:
+        return {
+            "candidates": 0,
+            "filtered_candidates": 0,
+            "new_positive": 0,
+            "new_negative": 0,
+            "added_to_train": 0,
+            "rejected_bidirectional": 0,
+            "rejected_confidence": 0,
+            "rejected_margin": 0,
+            "rejected_low_uncertainty": 0,
+            "rejected_uncertainty": 0,
+            "remaining_pool": 0,
+        }
+
+    left_ids = torch.tensor(sorted({l for l, _ in pool_pairs}), dtype=torch.long)
+    right_ids = torch.tensor(sorted({r for _, r in pool_pairs}), dtype=torch.long)
 
     left_outputs = encode_entity_outputs(
         model=model,
@@ -264,6 +281,7 @@ def run_active_learning_round(
         left_outputs=left_outputs,
         right_outputs=right_outputs,
         known_pairs=known_pairs,
+        queried_pairs=queried_pairs,
         budget=cfg.al_budget,
     )
 
@@ -278,7 +296,8 @@ def run_active_learning_round(
 
     filtered_candidates = filtered_candidates[:cfg.al_budget]
 
-    new_pos, new_neg = simulate_human_annotation(filtered_candidates, gold_test_pairs)
+    new_pos, new_neg = simulate_human_annotation(filtered_candidates, gold_pool_pairs)
+    queried_pairs.update(item["pair"] for item in filtered_candidates)
 
     added = 0
     for p in new_pos:
@@ -286,6 +305,9 @@ def run_active_learning_round(
             train_pairs.append(p)
             known_pairs.add(p)
             added += 1
+
+    if new_pos:
+        pool_pairs[:] = [p for p in pool_pairs if p not in set(new_pos)]
 
     return {
         "candidates": len(candidates),
@@ -298,4 +320,5 @@ def run_active_learning_round(
         "rejected_margin": rejected["margin"],
         "rejected_low_uncertainty": rejected["low_uncertainty"],
         "rejected_uncertainty": rejected["uncertainty"],
+        "remaining_pool": len(pool_pairs),
     }

@@ -1,10 +1,11 @@
-from typing import Dict
+import os
+from typing import Dict, List, Tuple
 
 import torch
 from torch_geometric.datasets import DBP15K
 
 
-def load_dbp15k_from_pyg(root: str = "data/DBP15K", pair: str = "zh_en") -> Dict:
+def load_dbp15k_from_pyg(root: str = "data/dbp15k", pair: str = "zh_en") -> Dict:
     dataset = DBP15K(root=root, pair=pair)
     data = dataset[0]
 
@@ -65,3 +66,127 @@ def load_dbp15k_from_pyg(root: str = "data/DBP15K", pair: str = "zh_en") -> Dict
         "test_pairs": test_pairs,
         "raw_data": data,
     }
+
+
+def _read_ent_id_mapping(path: str) -> Dict[int, int]:
+    raw_to_local = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for local_idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            raw_id_str, _ = line.split("\t", 1)
+            raw_to_local[int(raw_id_str)] = local_idx
+    return raw_to_local
+
+
+def _read_pair_ids(
+    path: str,
+    left_raw_to_local: Dict[int, int],
+    right_raw_to_local: Dict[int, int],
+    right_global_offset: int,
+) -> List[Tuple[int, int]]:
+    pairs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            left_raw_str, right_raw_str = line.split("\t")
+            left_raw = int(left_raw_str)
+            right_raw = int(right_raw_str)
+            left_local = left_raw_to_local[left_raw]
+            right_local = right_raw_to_local[right_raw]
+            pairs.append((left_local, right_local + right_global_offset))
+    return pairs
+
+
+def _read_positive_examples(
+    path: str,
+    left_raw_to_local: Dict[int, int],
+    right_raw_to_local: Dict[int, int],
+    right_global_offset: int,
+) -> List[Tuple[int, int]]:
+    pairs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            left_raw_str, right_raw_str, label_str = line.split("\t")
+            if int(label_str) != 1:
+                continue
+            left_raw = int(left_raw_str)
+            right_raw = int(right_raw_str)
+            left_local = left_raw_to_local[left_raw]
+            right_local = right_raw_to_local[right_raw]
+            pairs.append((left_local, right_local + right_global_offset))
+    return pairs
+
+
+def load_dbp15k_raw_split(
+    root: str = "data/dbp15k",
+    pair: str = "zh_en",
+    split: str = "0_3",
+) -> Dict:
+    base = load_dbp15k_from_pyg(root=root, pair=pair)
+
+    pair_dir = os.path.join(root, pair)
+    split_dir = os.path.join(pair_dir, split)
+
+    left_map = _read_ent_id_mapping(os.path.join(split_dir, "ent_ids_1"))
+    right_map = _read_ent_id_mapping(os.path.join(split_dir, "ent_ids_2"))
+
+    train_pairs = _read_pair_ids(
+        path=os.path.join(split_dir, "sup_ent_ids"),
+        left_raw_to_local=left_map,
+        right_raw_to_local=right_map,
+        right_global_offset=base["n1"],
+    )
+    test_pairs = _read_pair_ids(
+        path=os.path.join(split_dir, "ref_ent_ids"),
+        left_raw_to_local=left_map,
+        right_raw_to_local=right_map,
+        right_global_offset=base["n1"],
+    )
+
+    base["train_pairs"] = train_pairs
+    base["test_pairs"] = test_pairs
+    base["raw_split"] = split
+    return base
+
+
+def load_dbp15k_fixed_eval_split(
+    root: str = "data/dbp15k",
+    pair: str = "zh_en",
+) -> Dict:
+    base = load_dbp15k_from_pyg(root=root, pair=pair)
+
+    raw_pair_dir = os.path.join(root, "raw", pair)
+    left_map = _read_ent_id_mapping(os.path.join(raw_pair_dir, "ent_ids_1"))
+    right_map = _read_ent_id_mapping(os.path.join(raw_pair_dir, "ent_ids_2"))
+
+    train_pairs = _read_positive_examples(
+        path=os.path.join(raw_pair_dir, "train.examples.20"),
+        left_raw_to_local=left_map,
+        right_raw_to_local=right_map,
+        right_global_offset=base["n1"],
+    )
+    val_pairs = _read_positive_examples(
+        path=os.path.join(raw_pair_dir, "dev.examples.20"),
+        left_raw_to_local=left_map,
+        right_raw_to_local=right_map,
+        right_global_offset=base["n1"],
+    )
+    test_pairs = _read_positive_examples(
+        path=os.path.join(raw_pair_dir, "test.examples.1000"),
+        left_raw_to_local=left_map,
+        right_raw_to_local=right_map,
+        right_global_offset=base["n1"],
+    )
+
+    base["train_pairs"] = train_pairs
+    base["val_pairs"] = val_pairs
+    base["test_pairs"] = test_pairs
+    base["fixed_eval_split"] = True
+    return base

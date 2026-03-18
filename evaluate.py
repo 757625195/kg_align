@@ -98,11 +98,20 @@ def evaluate_alignment(
     adj_list,
     num_neighbors: int,
     test_pairs: List[Tuple[int, int]],
+    candidate_right_ids: torch.Tensor,
     batch_size: int,
     device: torch.device,
 ):
     left_ids = torch.tensor([l for l, _ in test_pairs], dtype=torch.long)
-    right_ids = torch.tensor([r for _, r in test_pairs], dtype=torch.long)
+    if candidate_right_ids.ndim != 1:
+        raise ValueError("candidate_right_ids must be a 1D tensor")
+
+    right_ids = candidate_right_ids.long().cpu()
+    right_index = {int(r.item()): idx for idx, r in enumerate(right_ids)}
+    gt = torch.tensor(
+        [right_index[r] for _, r in test_pairs],
+        dtype=torch.long,
+    )
 
     left_emb = encode_entities(
         model=model,
@@ -130,6 +139,5 @@ def evaluate_alignment(
     right_emb = F.normalize(right_emb, p=2, dim=-1)
 
     sim = model.score_pairs(left_emb, right_emb).cpu()
-    gt = torch.arange(sim.size(0), dtype=torch.long)
 
     return compute_metrics_from_similarity(sim, gt)

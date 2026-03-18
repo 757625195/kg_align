@@ -6,7 +6,7 @@ from typing import List, Tuple, Set, Dict, Any
 import torch
 from torch.utils.data import DataLoader
 
-from data_utils import load_dbp15k_from_pyg
+from data_utils import load_dbp15k_from_pyg, load_dbp15k_raw_split, load_dbp15k_fixed_eval_split
 from dataset import AlignmentTrainDataset, collate_alignment_batch
 from evaluate import evaluate_alignment, encode_entity_outputs
 from models.full_model import JointEAModel
@@ -21,13 +21,20 @@ class Config:
     # =========================
     # Data
     # =========================
-    root: str = "data/DBP15K"
+    root: str = "data/dbp15k"
     pair: str = "zh_en"
+    # Follow the commonly used DBP15K 0_3 supervision protocol for formal experiments.
+    data_source: str = "fixed_eval"
+    raw_split: str = "0_3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    val_ratio: float = 0.1
+    al_pool_ratio: float = 0.05
 
     # =========================
     # Training
     # =========================
+    # Training hyperparameters are chosen with reference to prior entity alignment
+    # work and adjusted to fit the current model architecture.
     batch_size: int = 128
     eval_batch_size: int = 256
 
@@ -68,7 +75,7 @@ class Config:
     # =========================
     lambda_branch_align: float = 0.15
     lambda_cross_modal: float = 0.03
-    lambda_joint_branch: float = 0.00
+    lambda_joint_branch: float = 0.05
     lambda_struct: float = 0.2
     lambda_sem: float = 0.2
     lambda_neg: float = 0.2
@@ -88,11 +95,11 @@ class Config:
     # Negative sampling
     # =========================
     num_random_neg: int = 1
-    num_hard_neg: int = 1
-    hard_topk: int = 5
-    num_global_hard_neg: int = 1
-    global_hard_topk: int = 10
-    global_hard_topk_max: int = 25
+    num_hard_neg: int = 2
+    hard_topk: int = 10
+    num_global_hard_neg: int = 2
+    global_hard_topk: int = 20
+    global_hard_topk_max: int = 50
     use_global_hard_neg: bool = True
     num_conflict_neg: int = 0
     memory_bank_epochs: int = 2
@@ -101,12 +108,12 @@ class Config:
     # Active Learning
     # =========================
     do_active_learning: bool = True
-    al_rounds: int = 3
-    al_budget: int = 100
-    al_every_epochs: int = 5
-    al_require_bidirectional: bool = False
-    al_min_confidence: float = 0.20
-    al_min_margin: float = 0.02
+    al_rounds: int = 2
+    al_budget: int = 20
+    al_every_epochs: int = 8
+    al_require_bidirectional: bool = True
+    al_min_confidence: float = 0.40
+    al_min_margin: float = 0.05
     al_min_uncertainty: float = 0.00
     al_max_uncertainty: float = 0.85
 
@@ -117,6 +124,7 @@ class Config:
     save_dir: str = "outputs"
     early_stop_patience: int = 4
     early_stop_min_delta: float = 1e-3
+    use_early_stopping: bool = True
 
     @property
     def experiment_tag(self) -> str:
@@ -142,6 +150,95 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def split_pairs(
+    pairs: List[Tuple[int, int]],
+    holdout_ratio: float,
+    seed: int,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    if not 0.0 < holdout_ratio < 1.0:
+        raise ValueError(f"holdout_ratio must be in (0, 1), got {holdout_ratio}")
+    if len(pairs) < 2:
+        raise ValueError("Need at least 2 pairs to create a holdout split")
+
+    shuffled = list(pairs)
+    rng = random.Random(seed)
+    rng.shuffle(shuffled)
+
+    holdout_size = max(1, int(round(len(shuffled) * holdout_ratio)))
+    holdout_size = min(holdout_size, len(shuffled) - 1)
+    holdout_pairs = shuffled[:holdout_size]
+    remain_pairs = shuffled[holdout_size:]
+    return remain_pairs, holdout_pairs
+
+
+def build_experiment_splits(
+    train_pairs: List[Tuple[int, int]],
+    test_pairs: List[Tuple[int, int]],
+    val_ratio: float,
+    al_pool_ratio: float,
+    seed: int,
+    do_active_learning: bool,
+) -> Dict[str, List[Tuple[int, int]]]:
+    train_after_val, val_pairs = split_pairs(train_pairs, val_ratio, seed)
+
+    if do_active_learning and al_pool_ratio > 0.0:
+        train_pairs, al_pool_pairs = split_pairs(train_after_val, al_pool_ratio, seed + 1)
+    else:
+        train_pairs = train_after_val
+        al_pool_pairs = []
+
+    return {
+        "train_pairs": train_pairs,
+        "val_pairs": val_pairs,
+        "al_pool_pairs": al_pool_pairs,
+        "test_pairs": list(test_pairs),
+    }
+
+
+def build_protocol_splits(cfg: Config, train_pairs: List[Tuple[int, int]], test_pairs: List[Tuple[int, int]]) -> Dict[str, List[Tuple[int, int]]]:
+    val_ratio = cfg.val_ratio
+    al_pool_ratio = cfg.al_pool_ratio
+
+    if cfg.data_source == "raw_split":
+        # Stay closer to the standard DBP15K split: keep most of the provided
+        # supervision in training and do not carve an extra AL pool by default.
+        val_ratio = min(val_ratio, 0.05)
+        if cfg.do_active_learning:
+            al_pool_ratio = 0.0
+
+    return build_experiment_splits(
+        train_pairs=train_pairs,
+        test_pairs=test_pairs,
+        val_ratio=val_ratio,
+        al_pool_ratio=al_pool_ratio,
+        seed=cfg.seed,
+        do_active_learning=cfg.do_active_learning,
+    )
+
+
+def build_fixed_eval_splits(
+    cfg: Config,
+    train_pairs: List[Tuple[int, int]],
+    val_pairs: List[Tuple[int, int]],
+    test_pairs: List[Tuple[int, int]],
+) -> Dict[str, List[Tuple[int, int]]]:
+    if cfg.do_active_learning and cfg.al_pool_ratio > 0.0:
+        train_pairs, al_pool_pairs = split_pairs(train_pairs, cfg.al_pool_ratio, cfg.seed + 1)
+    else:
+        al_pool_pairs = []
+
+    return {
+        "train_pairs": list(train_pairs),
+        "val_pairs": list(val_pairs),
+        "al_pool_pairs": list(al_pool_pairs),
+        "test_pairs": list(test_pairs),
+    }
+
+
+def should_use_early_stopping(cfg: Config) -> bool:
+    return cfg.use_early_stopping
+
+
 def apply_ablation_config(cfg: Config) -> None:
     if cfg.ablation_name == "full":
         return
@@ -158,6 +255,33 @@ def apply_ablation_config(cfg: Config) -> None:
         cfg.do_active_learning = False
         return
     raise ValueError(f"Unsupported ablation_name: {cfg.ablation_name}")
+
+
+def load_dataset(cfg: Config) -> Dict[str, Any]:
+    if cfg.data_source == "raw_split":
+        return load_dbp15k_raw_split(root=cfg.root, pair=cfg.pair, split=cfg.raw_split)
+    if cfg.data_source == "fixed_eval":
+        return load_dbp15k_fixed_eval_split(root=cfg.root, pair=cfg.pair)
+    raise ValueError(
+        f"Unsupported data_source: {cfg.data_source}. "
+        "This project now uses paper-style raw DBP15K splits for formal experiments."
+    )
+
+
+def build_candidate_right_ids(
+    cfg: Config,
+    n1: int,
+    n2: int,
+    eval_pairs: List[Tuple[int, int]],
+) -> torch.Tensor:
+    if cfg.data_source == "raw_split":
+        # Match the common DBP15K protocol: rank each left entity against the
+        # right-side reference pool of the current evaluation split.
+        return torch.tensor(
+            sorted({r for _, r in eval_pairs}),
+            dtype=torch.long,
+        )
+    return torch.arange(n1, n1 + n2, dtype=torch.long)
 
 
 def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
@@ -512,23 +636,41 @@ def main():
     device = torch.device(cfg.device)
     os.makedirs(cfg.save_dir, exist_ok=True)
 
-    print("Loading PyG DBP15K...")
-    data = load_dbp15k_from_pyg(root=cfg.root, pair=cfg.pair)
+    print("Loading DBP15K...")
+    data = load_dataset(cfg)
 
     total_nodes = data["total_nodes"]
+    n1 = data["n1"]
+    n2 = data["n2"]
     edge_index = data["edge_index"].to(device)
     seq_features = data["seq_features"]   # 通常放 CPU
-    train_pairs = list(data["train_pairs"])
-    test_pairs = list(data["test_pairs"])
+    raw_train_pairs = list(data["train_pairs"])
+    raw_test_pairs = list(data["test_pairs"])
+    if cfg.data_source == "fixed_eval":
+        raw_val_pairs = list(data["val_pairs"])
+        splits = build_fixed_eval_splits(cfg, raw_train_pairs, raw_val_pairs, raw_test_pairs)
+    else:
+        splits = build_protocol_splits(cfg, raw_train_pairs, raw_test_pairs)
+    train_pairs = splits["train_pairs"]
+    val_pairs = splits["val_pairs"]
+    al_pool_pairs = splits["al_pool_pairs"]
+    test_pairs = splits["test_pairs"]
+    val_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, val_pairs)
+    test_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, test_pairs)
 
     # 用 CPU 上的 edge_index 建邻接表，避免 GPU tensor 转 list 问题
     adj_list = build_adj_list(data["edge_index"].cpu(), total_nodes)
 
     print(f"Pair: {cfg.pair}")
+    print(f"Data source: {cfg.data_source}")
+    if cfg.data_source == "raw_split":
+        print(f"Raw split: {cfg.raw_split}")
     print(f"Experiment: {cfg.experiment_tag}")
     print(f"Total nodes: {total_nodes}")
     print(f"Edges total: {edge_index.size(1)}")
     print(f"Train pairs: {len(train_pairs)}")
+    print(f"Val pairs: {len(val_pairs)}")
+    print(f"AL pool pairs: {len(al_pool_pairs)}")
     print(f"Test pairs: {len(test_pairs)}")
     print(f"Sequence features: {tuple(seq_features.shape)}")
     print(
@@ -568,6 +710,7 @@ def main():
         f"min_unc={cfg.al_min_uncertainty:.2f}, "
         f"max_unc={cfg.al_max_uncertainty:.2f}"
     )
+    print(f"Early stopping enabled: {should_use_early_stopping(cfg)}")
 
     model = build_model(cfg, total_nodes=total_nodes).to(device)
     optimizer = torch.optim.AdamW(
@@ -578,6 +721,7 @@ def main():
 
     best_hits1 = -1.0
     best_path = os.path.join(cfg.save_dir, f"best_model_{cfg.pair}_{cfg.experiment_tag}.pt")
+    early_stopping_enabled = should_use_early_stopping(cfg)
 
     # =========================
     # Stage 1: Warmup
@@ -605,7 +749,8 @@ def main():
             seq_features=seq_features,
             adj_list=adj_list,
             num_neighbors=cfg.num_neighbors,
-            test_pairs=test_pairs,
+            test_pairs=val_pairs,
+            candidate_right_ids=val_candidate_right_ids,
             batch_size=cfg.eval_batch_size,
             device=device,
         )
@@ -615,9 +760,9 @@ def main():
             f"Loss: {train_stats['loss']:.4f} | "
             f"Struct: {train_stats['struct_loss']:.4f} | "
             f"Topo: {train_stats['topology_loss']:.4f} | "
-            f"Hits@1: {metrics['Hits@1']:.4f} | "
-            f"Hits@10: {metrics['Hits@10']:.4f} | "
-            f"MRR: {metrics['MRR']:.4f}"
+            f"ValHits@1: {metrics['Hits@1']:.4f} | "
+            f"ValHits@10: {metrics['Hits@10']:.4f} | "
+            f"ValMRR: {metrics['MRR']:.4f}"
         )
 
     # =========================
@@ -625,6 +770,7 @@ def main():
     # =========================
     print("\n===== Stage 2: Joint Training =====")
     al_round_done = 0
+    queried_al_pairs = set()
     negative_bank_history = []
     early_stop_counter = 0
 
@@ -674,7 +820,8 @@ def main():
             seq_features=seq_features,
             adj_list=adj_list,
             num_neighbors=cfg.num_neighbors,
-            test_pairs=test_pairs,
+            test_pairs=val_pairs,
+            candidate_right_ids=val_candidate_right_ids,
             batch_size=cfg.eval_batch_size,
             device=device,
         )
@@ -691,9 +838,9 @@ def main():
             f"Neg: {train_stats['neg_loss']:.4f} | "
             f"Topo: {train_stats['topology_loss']:.4f} | "
             f"TopK: {dynamic_global_topk} | "
-            f"Hits@1: {metrics['Hits@1']:.4f} | "
-            f"Hits@10: {metrics['Hits@10']:.4f} | "
-            f"MRR: {metrics['MRR']:.4f}"
+            f"ValHits@1: {metrics['Hits@1']:.4f} | "
+            f"ValHits@10: {metrics['Hits@10']:.4f} | "
+            f"ValMRR: {metrics['MRR']:.4f}"
         )
 
         if metrics["Hits@1"] > best_hits1 + cfg.early_stop_min_delta:
@@ -710,7 +857,7 @@ def main():
         else:
             early_stop_counter += 1
 
-        if early_stop_counter >= cfg.early_stop_patience:
+        if early_stopping_enabled and early_stop_counter >= cfg.early_stop_patience:
             print(
                 f"Early stopping triggered at joint epoch {epoch:03d} "
                 f"(best Hits@1={best_hits1:.4f})"
@@ -732,7 +879,8 @@ def main():
                 seq_features=seq_features,
                 adj_list=adj_list,
                 train_pairs=train_pairs,
-                test_pairs=test_pairs,
+                pool_pairs=al_pool_pairs,
+                queried_pairs=queried_al_pairs,
                 device=device,
             )
             al_round_done += 1
@@ -748,11 +896,33 @@ def main():
                 f"RejectConf: {al_stats['rejected_confidence']} | "
                 f"RejectMargin: {al_stats['rejected_margin']} | "
                 f"RejectLowUnc: {al_stats['rejected_low_uncertainty']} | "
-                f"RejectUnc: {al_stats['rejected_uncertainty']}"
+                f"RejectUnc: {al_stats['rejected_uncertainty']} | "
+                f"PoolLeft: {al_stats['remaining_pool']}"
             )
 
     print("\nTraining finished.")
     print(f"Best Hits@1: {best_hits1:.4f}")
+
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        final_test_metrics = evaluate_alignment(
+            model=model,
+            edge_index=edge_index,
+            seq_features=seq_features,
+            adj_list=adj_list,
+            num_neighbors=cfg.num_neighbors,
+            test_pairs=test_pairs,
+            candidate_right_ids=test_candidate_right_ids,
+            batch_size=cfg.eval_batch_size,
+            device=device,
+        )
+        print(
+            "Final test metrics from best validation checkpoint | "
+            f"Hits@1: {final_test_metrics['Hits@1']:.4f} | "
+            f"Hits@10: {final_test_metrics['Hits@10']:.4f} | "
+            f"MRR: {final_test_metrics['MRR']:.4f}"
+        )
 
 
 if __name__ == "__main__":
