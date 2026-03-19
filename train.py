@@ -78,7 +78,8 @@ class Config:
     lambda_joint_branch: float = 0.05
     lambda_struct: float = 0.2
     lambda_sem: float = 0.2
-    lambda_neg: float = 0.2
+    lambda_neg: float = 0.3
+    lambda_ranking: float = 0.05
     lambda_topology: float = 0.00
     branch_align_start: float = 0.15
     branch_align_end: float = 0.50
@@ -89,7 +90,7 @@ class Config:
 
     temperature: float = 0.07
     margin: float = 0.2
-    hard_negative_weight: float = 1.5
+    hard_negative_weight: float = 2.0
 
     # =========================
     # Negative sampling
@@ -109,11 +110,11 @@ class Config:
     # =========================
     do_active_learning: bool = True
     al_rounds: int = 2
-    al_budget: int = 20
+    al_budget: int = 30
     al_every_epochs: int = 8
     al_require_bidirectional: bool = True
-    al_min_confidence: float = 0.40
-    al_min_margin: float = 0.05
+    al_min_confidence: float = 0.35
+    al_min_margin: float = 0.03
     al_min_uncertainty: float = 0.00
     al_max_uncertainty: float = 0.85
     al_negative_batch_size: int = 32
@@ -476,6 +477,7 @@ def train_one_epoch(
     total_sem = 0.0
     total_neg = 0.0
     total_al_neg = 0.0
+    total_ranking = 0.0
     total_topology = 0.0
     num_batches = 0
 
@@ -638,6 +640,7 @@ def train_one_epoch(
             lambda_struct=cfg.lambda_struct,
             lambda_sem=cfg.lambda_sem,
             lambda_neg=cfg.lambda_neg,
+            lambda_ranking=cfg.lambda_ranking,
             lambda_topology=cfg.lambda_topology,
             current_joint_epoch=current_joint_epoch,
             total_joint_epochs=total_joint_epochs,
@@ -674,6 +677,7 @@ def train_one_epoch(
         total_sem += loss_dict["sem_loss"].item()
         total_neg += loss_dict["neg_loss"].item()
         total_al_neg += loss_dict["al_neg_loss"].item()
+        total_ranking += loss_dict["ranking_loss"].item()
         total_topology += loss_dict["topology_loss"].item()
         num_batches += 1
 
@@ -690,6 +694,7 @@ def train_one_epoch(
         "sem_loss": total_sem / max(1, num_batches),
         "neg_loss": total_neg / max(1, num_batches),
         "al_neg_loss": total_al_neg / max(1, num_batches),
+        "ranking_loss": total_ranking / max(1, num_batches),
         "topology_loss": total_topology / max(1, num_batches),
     }
 
@@ -762,6 +767,7 @@ def main():
         f"branch={cfg.lambda_branch_align} [{cfg.branch_align_start:.2f},{cfg.branch_align_end:.2f}], "
         f"cross={cfg.lambda_cross_modal} [{cfg.cross_modal_start:.2f},{cfg.cross_modal_end:.2f}], "
         f"joint_branch={cfg.lambda_joint_branch} [{cfg.joint_branch_start:.2f},{cfg.joint_branch_end:.2f}], "
+        f"ranking={cfg.lambda_ranking:.2f}, "
         f"topology={cfg.lambda_topology:.2f}"
     )
     print(
@@ -911,6 +917,7 @@ def main():
             f"Sem: {train_stats['sem_loss']:.4f} | "
             f"Neg: {train_stats['neg_loss']:.4f} | "
             f"ALNeg: {train_stats['al_neg_loss']:.4f} | "
+            f"Rank: {train_stats['ranking_loss']:.4f} | "
             f"Topo: {train_stats['topology_loss']:.4f} | "
             f"TopK: {dynamic_global_topk} | "
             f"ValHits@1: {metrics['Hits@1']:.4f} | "

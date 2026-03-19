@@ -124,6 +124,34 @@ def explicit_negative_pair_loss(
     return F.relu(neg_sim - margin).mean()
 
 
+def hardest_negative_ranking_loss(
+    pos_left: torch.Tensor,
+    pos_right: torch.Tensor,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """
+    Encourage the gold pair to outrank the hardest in-batch impostor on both
+    left-to-right and right-to-left retrieval.
+    """
+    if pos_left.size(0) <= 1:
+        return pos_left.new_tensor(0.0)
+
+    left = F.normalize(pos_left, p=2, dim=-1)
+    right = F.normalize(pos_right, p=2, dim=-1)
+    sim = left @ right.t()
+    pos_sim = sim.diag()
+
+    mask = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
+    neg_sim = sim.masked_fill(mask, float("-inf"))
+
+    hardest_right = neg_sim.max(dim=1).values
+    hardest_left = neg_sim.max(dim=0).values
+
+    loss_lr = F.relu(margin - pos_sim + hardest_right).mean()
+    loss_rl = F.relu(margin - pos_sim + hardest_left).mean()
+    return 0.5 * (loss_lr + loss_rl)
+
+
 def structure_consistency_loss(
     z_struct: torch.Tensor,
     z_joint: torch.Tensor
@@ -171,6 +199,7 @@ def total_loss(
     lambda_struct: float = 0.2,
     lambda_sem: float = 0.2,
     lambda_neg: float = 0.2,
+    lambda_ranking: float = 0.0,
     lambda_topology: float = 0.15,
     current_joint_epoch: int = 1,
     total_joint_epochs: int = 1,
@@ -226,6 +255,7 @@ def total_loss(
             "sem_loss": zero,
             "neg_loss": zero,
             "al_neg_loss": zero,
+            "ranking_loss": zero,
             "topology_loss": zero,
         }
 
@@ -290,6 +320,12 @@ def total_loss(
         margin=margin,
     )
 
+    ranking_loss = hardest_negative_ranking_loss(
+        pos_left=left_outputs["z_joint"],
+        pos_right=right_outputs["z_joint"],
+        margin=margin,
+    )
+
     topology_loss = topology_matching_loss(
         left_hop2=left_outputs["z_hop2"],
         right_hop2=right_outputs["z_hop2"],
@@ -307,6 +343,7 @@ def total_loss(
         lambda_sem * sem_reg +
         lambda_neg * neg_loss +
         lambda_neg * al_negative_weight * al_neg_loss +
+        lambda_ranking * ranking_loss +
         lambda_topology * topology_loss
     )
 
@@ -323,5 +360,6 @@ def total_loss(
         "sem_loss": sem_reg,
         "neg_loss": neg_loss,
         "al_neg_loss": al_neg_loss,
+        "ranking_loss": ranking_loss,
         "topology_loss": topology_loss,
     }
