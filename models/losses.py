@@ -104,6 +104,26 @@ def margin_based_negative_loss(
     return hard_weight * loss
 
 
+def explicit_negative_pair_loss(
+    neg_left: torch.Tensor = None,
+    neg_right: torch.Tensor = None,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """
+    Penalize explicitly confirmed negative pairs from active learning.
+    Their similarity should stay below the decision margin.
+    """
+    if neg_left is None or neg_right is None:
+        if neg_left is not None:
+            return neg_left.new_tensor(0.0)
+        if neg_right is not None:
+            return neg_right.new_tensor(0.0)
+        return torch.tensor(0.0)
+
+    neg_sim = cosine_sim(neg_left, neg_right)
+    return F.relu(neg_sim - margin).mean()
+
+
 def structure_consistency_loss(
     z_struct: torch.Tensor,
     z_joint: torch.Tensor
@@ -163,8 +183,11 @@ def total_loss(
     temperature: float = 0.07,
     neg_left_joint: torch.Tensor = None,
     neg_right_joint: torch.Tensor = None,
+    al_neg_left_joint: torch.Tensor = None,
+    al_neg_right_joint: torch.Tensor = None,
     margin: float = 0.2,
     hard_negative_weight: float = 1.0,
+    al_negative_weight: float = 1.0,
     warmup_mode: bool = False,
 ):
     """
@@ -202,6 +225,7 @@ def total_loss(
             "struct_loss": struct_loss,
             "sem_loss": zero,
             "neg_loss": zero,
+            "al_neg_loss": zero,
             "topology_loss": zero,
         }
 
@@ -260,6 +284,12 @@ def total_loss(
         hard_weight=hard_negative_weight,
     )
 
+    al_neg_loss = explicit_negative_pair_loss(
+        neg_left=al_neg_left_joint,
+        neg_right=al_neg_right_joint,
+        margin=margin,
+    )
+
     topology_loss = topology_matching_loss(
         left_hop2=left_outputs["z_hop2"],
         right_hop2=right_outputs["z_hop2"],
@@ -276,6 +306,7 @@ def total_loss(
         lambda_struct * struct_reg +
         lambda_sem * sem_reg +
         lambda_neg * neg_loss +
+        lambda_neg * al_negative_weight * al_neg_loss +
         lambda_topology * topology_loss
     )
 
@@ -291,5 +322,6 @@ def total_loss(
         "struct_loss": struct_reg,
         "sem_loss": sem_reg,
         "neg_loss": neg_loss,
+        "al_neg_loss": al_neg_loss,
         "topology_loss": topology_loss,
     }

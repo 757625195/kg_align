@@ -116,6 +116,8 @@ class Config:
     al_min_margin: float = 0.05
     al_min_uncertainty: float = 0.00
     al_max_uncertainty: float = 0.85
+    al_negative_batch_size: int = 32
+    al_negative_weight: float = 1.0
 
     # =========================
     # Misc
@@ -148,6 +150,24 @@ def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def apply_runtime_overrides(cfg: Config) -> None:
+    seed_env = os.environ.get("KG_ALIGN_SEED")
+    if seed_env is not None:
+        cfg.seed = int(seed_env)
+
+    ablation_env = os.environ.get("KG_ALIGN_ABLATION")
+    if ablation_env:
+        cfg.ablation_name = ablation_env
+
+    al_env = os.environ.get("KG_ALIGN_AL")
+    if al_env is not None:
+        cfg.do_active_learning = al_env.strip().lower() in {"1", "true", "yes", "on"}
+
+    data_source_env = os.environ.get("KG_ALIGN_DATA_SOURCE")
+    if data_source_env:
+        cfg.data_source = data_source_env
 
 
 def split_pairs(
@@ -431,6 +451,7 @@ def train_one_epoch(
     cfg: Config,
     device: torch.device,
     all_train_pairs: List[Tuple[int, int]],
+    al_negative_pairs: List[Tuple[int, int]] = None,
     negative_bank: Dict[str, torch.Tensor] = None,
     dynamic_global_topk: int = None,
     current_joint_epoch: int = 1,
@@ -454,6 +475,7 @@ def train_one_epoch(
     total_struct = 0.0
     total_sem = 0.0
     total_neg = 0.0
+    total_al_neg = 0.0
     total_topology = 0.0
     num_batches = 0
 
@@ -484,6 +506,8 @@ def train_one_epoch(
 
         neg_left_joint = None
         neg_right_joint = None
+        al_neg_left_joint = None
+        al_neg_right_joint = None
 
         # 非 warmup 阶段才做对齐损失和负样本
         if not warmup_mode:
@@ -567,6 +591,43 @@ def train_one_epoch(
                 neg_left_joint = neg_left_out["z_joint"]
                 neg_right_joint = neg_right_out["z_joint"]
 
+            if al_negative_pairs:
+                sample_size = min(cfg.al_negative_batch_size, len(al_negative_pairs))
+                sampled_al_negs = random.sample(al_negative_pairs, sample_size)
+                al_neg_left_ids = torch.tensor(
+                    [l for l, _ in sampled_al_negs],
+                    dtype=torch.long,
+                    device=device,
+                )
+                al_neg_right_ids = torch.tensor(
+                    [r for _, r in sampled_al_negs],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                al_neg_left_out = forward_entities(
+                    model=model,
+                    node_ids=al_neg_left_ids,
+                    edge_index=edge_index,
+                    seq_features=seq_features,
+                    adj_list=adj_list,
+                    cfg=cfg,
+                    device=device,
+                )
+
+                al_neg_right_out = forward_entities(
+                    model=model,
+                    node_ids=al_neg_right_ids,
+                    edge_index=edge_index,
+                    seq_features=seq_features,
+                    adj_list=adj_list,
+                    cfg=cfg,
+                    device=device,
+                )
+
+                al_neg_left_joint = al_neg_left_out["z_joint"]
+                al_neg_right_joint = al_neg_right_out["z_joint"]
+
         # 计算总损失
         loss_dict = total_loss(
             left_outputs=left_out,
@@ -589,8 +650,11 @@ def train_one_epoch(
             temperature=cfg.temperature,
             neg_left_joint=neg_left_joint,
             neg_right_joint=neg_right_joint,
+            al_neg_left_joint=al_neg_left_joint,
+            al_neg_right_joint=al_neg_right_joint,
             margin=cfg.margin,
             hard_negative_weight=cfg.hard_negative_weight,
+            al_negative_weight=cfg.al_negative_weight,
             warmup_mode=warmup_mode,
         )
 
@@ -609,6 +673,7 @@ def train_one_epoch(
         total_struct += loss_dict["struct_loss"].item()
         total_sem += loss_dict["sem_loss"].item()
         total_neg += loss_dict["neg_loss"].item()
+        total_al_neg += loss_dict["al_neg_loss"].item()
         total_topology += loss_dict["topology_loss"].item()
         num_batches += 1
 
@@ -624,12 +689,14 @@ def train_one_epoch(
         "struct_loss": total_struct / max(1, num_batches),
         "sem_loss": total_sem / max(1, num_batches),
         "neg_loss": total_neg / max(1, num_batches),
+        "al_neg_loss": total_al_neg / max(1, num_batches),
         "topology_loss": total_topology / max(1, num_batches),
     }
 
 
 def main():
     cfg = Config()
+    apply_runtime_overrides(cfg)
     apply_ablation_config(cfg)
     set_seed(cfg.seed)
 
@@ -710,6 +777,11 @@ def main():
         f"min_unc={cfg.al_min_uncertainty:.2f}, "
         f"max_unc={cfg.al_max_uncertainty:.2f}"
     )
+    print(
+        "Active learning negatives: "
+        f"batch_size={cfg.al_negative_batch_size}, "
+        f"weight={cfg.al_negative_weight:.2f}"
+    )
     print(f"Early stopping enabled: {should_use_early_stopping(cfg)}")
 
     model = build_model(cfg, total_nodes=total_nodes).to(device)
@@ -771,6 +843,7 @@ def main():
     print("\n===== Stage 2: Joint Training =====")
     al_round_done = 0
     queried_al_pairs = set()
+    al_negative_pairs = []
     negative_bank_history = []
     early_stop_counter = 0
 
@@ -807,6 +880,7 @@ def main():
             cfg=cfg,
             device=device,
             all_train_pairs=train_pairs,
+            al_negative_pairs=al_negative_pairs,
             negative_bank=negative_bank,
             dynamic_global_topk=dynamic_global_topk,
             current_joint_epoch=epoch,
@@ -836,6 +910,7 @@ def main():
             f"Struct: {train_stats['struct_loss']:.4f} | "
             f"Sem: {train_stats['sem_loss']:.4f} | "
             f"Neg: {train_stats['neg_loss']:.4f} | "
+            f"ALNeg: {train_stats['al_neg_loss']:.4f} | "
             f"Topo: {train_stats['topology_loss']:.4f} | "
             f"TopK: {dynamic_global_topk} | "
             f"ValHits@1: {metrics['Hits@1']:.4f} | "
@@ -884,6 +959,9 @@ def main():
                 device=device,
             )
             al_round_done += 1
+            for pair in al_stats["negative_pairs"]:
+                if pair not in al_negative_pairs:
+                    al_negative_pairs.append(pair)
 
             print(
                 f"[AL    ] Round {al_round_done:02d} | "
@@ -897,7 +975,8 @@ def main():
                 f"RejectMargin: {al_stats['rejected_margin']} | "
                 f"RejectLowUnc: {al_stats['rejected_low_uncertainty']} | "
                 f"RejectUnc: {al_stats['rejected_uncertainty']} | "
-                f"PoolLeft: {al_stats['remaining_pool']}"
+                f"PoolLeft: {al_stats['remaining_pool']} | "
+                f"ALNegPool: {len(al_negative_pairs)}"
             )
 
     print("\nTraining finished.")

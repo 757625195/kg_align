@@ -248,6 +248,7 @@ def run_active_learning_round(
             "rejected_low_uncertainty": 0,
             "rejected_uncertainty": 0,
             "remaining_pool": 0,
+            "negative_pairs": [],
         }
 
     left_ids = torch.tensor(sorted({l for l, _ in pool_pairs}), dtype=torch.long)
@@ -321,4 +322,5 @@ def run_active_learning_round(
         "rejected_low_uncertainty": rejected["low_uncertainty"],
         "rejected_uncertainty": rejected["uncertainty"],
         "remaining_pool": len(pool_pairs),
+        "negative_pairs": list(new_neg),
     }
