@@ -52,6 +52,7 @@ class Config:
     gnn_hidden_dim: int = 128
     text_hidden_dim: int = 128
     fusion_dim: int = 128
+    ce_residual_ratio: float = 0.1
     gnn_layers: int = 2
     gnn_share_parameters: bool = False
     gnn_use_depthwise_separable: bool = False
@@ -170,6 +171,10 @@ def apply_runtime_overrides(cfg: Config) -> None:
     if data_source_env:
         cfg.data_source = data_source_env
 
+    ce_ratio_env = os.environ.get("KG_ALIGN_CE_RATIO")
+    if ce_ratio_env is not None:
+        cfg.ce_residual_ratio = float(ce_ratio_env)
+
 
 def split_pairs(
     pairs: List[Tuple[int, int]],
@@ -271,6 +276,10 @@ def apply_ablation_config(cfg: Config) -> None:
         return
     if cfg.ablation_name == "w_o_CE":
         cfg.use_cross_modal_enhancement = False
+        # Keep the ablation semantically clean: once the fusion module is
+        # removed, the CE-specific consistency objectives should also be off.
+        cfg.lambda_cross_modal = 0.0
+        cfg.lambda_joint_branch = 0.0
         return
     if cfg.ablation_name == "w_o_AL":
         cfg.do_active_learning = False
@@ -319,6 +328,7 @@ def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
         text_heads=cfg.text_heads,
         text_layers=cfg.text_layers,
         dropout=cfg.dropout,
+        ce_residual_ratio=cfg.ce_residual_ratio,
         use_mst=cfg.use_mst,
         use_light_gnn=cfg.use_light_gnn,
         use_cross_modal_enhancement=cfg.use_cross_modal_enhancement,
@@ -775,6 +785,7 @@ def main():
         f"shared_gnn={cfg.gnn_share_parameters}, "
         f"depthwise_separable={cfg.gnn_use_depthwise_separable}"
     )
+    print(f"CE residual ratio: {cfg.ce_residual_ratio:.2f}")
     print(
         "Active learning filters: "
         f"bidirectional={cfg.al_require_bidirectional}, "

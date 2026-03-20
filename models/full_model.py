@@ -21,6 +21,7 @@ class JointEAModel(nn.Module):
         text_heads: int = 4,
         text_layers: int = 2,
         dropout: float = 0.1,
+        ce_residual_ratio: float = 0.3,
         use_mst: bool = True,
         use_light_gnn: bool = True,
         use_cross_modal_enhancement: bool = True,
@@ -70,6 +71,7 @@ class JointEAModel(nn.Module):
             dim=fusion_dim,
             hidden_dim=fusion_dim,
             dropout=dropout,
+            residual_ratio=ce_residual_ratio,
         )
 
         self.align_head = AlignmentHead()

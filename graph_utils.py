@@ -1,6 +1,5 @@
 # graph_utils.py
 from typing import Dict, List
-import random
 import torch
 
 
@@ -22,12 +21,13 @@ def sample_neighbors(
     device: torch.device,
 ):
     """
-    为每个节点固定采样 K 个邻居。
+    为每个节点稳定选择 K 个邻居。
 
-    这里的设计目的不是显式展开完整多跳子图，而是:
+    这里不再使用随机采样，而是按邻接表中的固定顺序截取。
+    这样做的目的在于:
     - 控制每个 batch 的结构上下文规模，避免邻居爆炸
-    - 为后续跨模态融合提供局部结构证据
-    - 在大图上保持近似线性的邻居访问成本
+    - 为跨模态融合提供可复现的局部结构证据
+    - 减少随机邻居扰动对融合模块训练稳定性的影响
     """
     batch_ids = node_ids.detach().cpu().tolist()
 
@@ -42,11 +42,11 @@ def sample_neighbors(
             mask = [0] * num_neighbors
         else:
             if len(neighbors) >= num_neighbors:
-                picked = random.sample(neighbors, num_neighbors)
+                picked = neighbors[:num_neighbors]
             else:
                 picked = neighbors[:]
                 while len(picked) < num_neighbors:
-                    picked.append(random.choice(neighbors))
+                    picked.append(neighbors[len(picked) % len(neighbors)])
             ids = picked
             mask = [1] * num_neighbors
 
