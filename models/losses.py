@@ -8,6 +8,29 @@ def cosine_sim(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return (x1 * x2).sum(dim=-1)
 
 
+def reshape_sampled_negative_sim(
+    pos_left: torch.Tensor,
+    neg_left: torch.Tensor = None,
+    neg_right: torch.Tensor = None,
+) -> torch.Tensor:
+    if neg_left is None or neg_right is None:
+        return None
+
+    batch_size = pos_left.size(0)
+    if batch_size <= 0:
+        return None
+
+    neg_sim = cosine_sim(neg_left, neg_right)
+    if neg_sim.numel() < batch_size:
+        return None
+
+    usable = (neg_sim.numel() // batch_size) * batch_size
+    if usable <= 0:
+        return None
+
+    return neg_sim[:usable].view(batch_size, -1)
+
+
 def info_nce_loss(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -85,6 +108,7 @@ def margin_based_negative_loss(
     neg_right: torch.Tensor = None,
     margin: float = 0.2,
     hard_weight: float = 1.0,
+    per_pair_hard: bool = False,
 ) -> torch.Tensor:
     """
     一个轻量可运行版负样本损失：
@@ -95,12 +119,24 @@ def margin_based_negative_loss(
         return pos_left.new_tensor(0.0)
 
     pos_sim = cosine_sim(pos_left, pos_right)   # [B]
-    neg_sim = cosine_sim(neg_left, neg_right)   # [K]
+    neg_per = reshape_sampled_negative_sim(
+        pos_left=pos_left,
+        neg_left=neg_left,
+        neg_right=neg_right,
+    )
 
-    # 用正样本平均相似度作为参考
-    pos_ref = pos_sim.mean()
-
-    loss = F.relu(margin - pos_ref + neg_sim).mean()
+    if neg_per is not None:
+        if per_pair_hard:
+            hard_neg = neg_per.max(dim=1).values
+            loss = F.relu(margin - pos_sim + hard_neg).mean()
+        else:
+            pos_ref = pos_sim.unsqueeze(1)
+            loss = F.relu(margin - pos_ref + neg_per).mean()
+    else:
+        # Fallback to global reference when the shapes do not align.
+        neg_sim = cosine_sim(neg_left, neg_right)   # [K]
+        pos_ref = pos_sim.mean()
+        loss = F.relu(margin - pos_ref + neg_sim).mean()
     return hard_weight * loss
 
 
@@ -128,12 +164,15 @@ def hardest_negative_ranking_loss(
     pos_left: torch.Tensor,
     pos_right: torch.Tensor,
     margin: float = 0.2,
+    sampled_neg_left: torch.Tensor = None,
+    sampled_neg_right: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Encourage the gold pair to outrank the hardest in-batch impostor on both
-    left-to-right and right-to-left retrieval.
+    left-to-right and right-to-left retrieval, and optionally the hardest
+    sampled negative pairs collected by the mining pipeline.
     """
-    if pos_left.size(0) <= 1:
+    if pos_left.size(0) <= 1 and (sampled_neg_left is None or sampled_neg_right is None):
         return pos_left.new_tensor(0.0)
 
     left = F.normalize(pos_left, p=2, dim=-1)
@@ -141,15 +180,27 @@ def hardest_negative_ranking_loss(
     sim = left @ right.t()
     pos_sim = sim.diag()
 
-    mask = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-    neg_sim = sim.masked_fill(mask, float("-inf"))
+    hardest_any = pos_sim.new_full(pos_sim.shape, -1e9)
+    if pos_left.size(0) > 1:
+        mask = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
+        neg_sim = sim.masked_fill(mask, float("-inf"))
+        hardest_right = neg_sim.max(dim=1).values
+        hardest_left = neg_sim.max(dim=0).values
+        hardest_any = torch.maximum(hardest_right, hardest_left)
 
-    hardest_right = neg_sim.max(dim=1).values
-    hardest_left = neg_sim.max(dim=0).values
+    sampled_neg_per = reshape_sampled_negative_sim(
+        pos_left=pos_left,
+        neg_left=sampled_neg_left,
+        neg_right=sampled_neg_right,
+    )
+    if sampled_neg_per is not None:
+        sampled_hardest = sampled_neg_per.max(dim=1).values
+        hardest_any = torch.maximum(hardest_any, sampled_hardest)
 
-    loss_lr = F.relu(margin - pos_sim + hardest_right).mean()
-    loss_rl = F.relu(margin - pos_sim + hardest_left).mean()
-    return 0.5 * (loss_lr + loss_rl)
+    valid_mask = hardest_any > -1e8
+    if not valid_mask.any():
+        return pos_left.new_tensor(0.0)
+    return F.relu(margin - pos_sim[valid_mask] + hardest_any[valid_mask]).mean()
 
 
 def structure_consistency_loss(
@@ -209,6 +260,8 @@ def total_loss(
     cross_modal_end: float = 0.65,
     joint_branch_start: float = 0.40,
     joint_branch_end: float = 0.80,
+    topology_start: float = 0.55,
+    topology_end: float = 0.90,
     temperature: float = 0.07,
     neg_left_joint: torch.Tensor = None,
     neg_right_joint: torch.Tensor = None,
@@ -217,6 +270,8 @@ def total_loss(
     margin: float = 0.2,
     hard_negative_weight: float = 1.0,
     al_negative_weight: float = 1.0,
+    use_pairwise_hard_neg: bool = False,
+    per_pair_hard_neg: bool = False,
     warmup_mode: bool = False,
 ):
     """
@@ -251,6 +306,7 @@ def total_loss(
             "branch_align_scale": zero,
             "cross_modal_scale": zero,
             "joint_branch_scale": zero,
+            "topology_scale": zero,
             "struct_loss": struct_loss,
             "sem_loss": zero,
             "neg_loss": zero,
@@ -272,6 +328,7 @@ def total_loss(
     branch_align_scale = rampup_weight(progress, branch_align_start, branch_align_end)
     cross_modal_scale = rampup_weight(progress, cross_modal_start, cross_modal_end)
     joint_branch_scale = rampup_weight(progress, joint_branch_start, joint_branch_end)
+    topology_scale = rampup_weight(progress, topology_start, topology_end)
 
     left_branch = left_outputs.get("z_struct_enhanced", left_outputs["z_struct"])
     right_branch = right_outputs.get("z_struct_enhanced", right_outputs["z_struct"])
@@ -305,14 +362,22 @@ def total_loss(
         semantic_consistency_loss(right_sem_branch, right_outputs["z_joint"])
     )
 
-    neg_loss = margin_based_negative_loss(
-        pos_left=left_outputs["z_joint"],
-        pos_right=right_outputs["z_joint"],
-        neg_left=neg_left_joint,
-        neg_right=neg_right_joint,
-        margin=margin,
-        hard_weight=hard_negative_weight,
-    )
+    if use_pairwise_hard_neg:
+        neg_loss = hard_negative_weight * hardest_negative_ranking_loss(
+            pos_left=left_outputs["z_joint"],
+            pos_right=right_outputs["z_joint"],
+            margin=margin,
+        )
+    else:
+        neg_loss = margin_based_negative_loss(
+            pos_left=left_outputs["z_joint"],
+            pos_right=right_outputs["z_joint"],
+            neg_left=neg_left_joint,
+            neg_right=neg_right_joint,
+            margin=margin,
+            hard_weight=hard_negative_weight,
+            per_pair_hard=per_pair_hard_neg,
+        )
 
     al_neg_loss = explicit_negative_pair_loss(
         neg_left=al_neg_left_joint,
@@ -324,6 +389,8 @@ def total_loss(
         pos_left=left_outputs["z_joint"],
         pos_right=right_outputs["z_joint"],
         margin=margin,
+        sampled_neg_left=neg_left_joint,
+        sampled_neg_right=neg_right_joint,
     )
 
     topology_loss = topology_matching_loss(
@@ -344,7 +411,7 @@ def total_loss(
         lambda_neg * neg_loss +
         lambda_neg * al_negative_weight * al_neg_loss +
         lambda_ranking * ranking_loss +
-        lambda_topology * topology_loss
+        (lambda_topology * topology_scale) * topology_loss
     )
 
     return {
@@ -356,6 +423,7 @@ def total_loss(
         "branch_align_scale": align.new_tensor(branch_align_scale),
         "cross_modal_scale": align.new_tensor(cross_modal_scale),
         "joint_branch_scale": align.new_tensor(joint_branch_scale),
+        "topology_scale": align.new_tensor(topology_scale),
         "struct_loss": struct_reg,
         "sem_loss": sem_reg,
         "neg_loss": neg_loss,

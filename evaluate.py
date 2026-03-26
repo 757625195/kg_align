@@ -74,6 +74,19 @@ def encode_entities(
     return outputs[output_key]
 
 
+def fuse_entity_outputs(
+    outputs: Dict[str, torch.Tensor],
+    weights: Tuple[float, float, float],
+) -> torch.Tensor:
+    w_joint, w_struct, w_sem = weights
+    fused = (
+        w_joint * outputs["z_joint"] +
+        w_struct * outputs["z_struct_enhanced"] +
+        w_sem * outputs["z_sem_enhanced"]
+    )
+    return F.normalize(fused, p=2, dim=-1)
+
+
 @torch.no_grad()
 def compute_metrics_from_similarity(
     sim: torch.Tensor,
@@ -101,6 +114,7 @@ def evaluate_alignment(
     candidate_right_ids: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    fusion_weights: Tuple[float, float, float] = None,
 ):
     left_ids = torch.tensor([l for l, _ in test_pairs], dtype=torch.long)
     if candidate_right_ids.ndim != 1:
@@ -113,27 +127,51 @@ def evaluate_alignment(
         dtype=torch.long,
     )
 
-    left_emb = encode_entities(
-        model=model,
-        node_ids=left_ids,
-        edge_index=edge_index,
-        seq_features=seq_features,
-        adj_list=adj_list,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        device=device,
-    )
+    if fusion_weights is None:
+        left_emb = encode_entities(
+            model=model,
+            node_ids=left_ids,
+            edge_index=edge_index,
+            seq_features=seq_features,
+            adj_list=adj_list,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            device=device,
+        )
 
-    right_emb = encode_entities(
-        model=model,
-        node_ids=right_ids,
-        edge_index=edge_index,
-        seq_features=seq_features,
-        adj_list=adj_list,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        device=device,
-    )
+        right_emb = encode_entities(
+            model=model,
+            node_ids=right_ids,
+            edge_index=edge_index,
+            seq_features=seq_features,
+            adj_list=adj_list,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            device=device,
+        )
+    else:
+        left_outputs = encode_entity_outputs(
+            model=model,
+            node_ids=left_ids,
+            edge_index=edge_index,
+            seq_features=seq_features,
+            adj_list=adj_list,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            device=device,
+        )
+        right_outputs = encode_entity_outputs(
+            model=model,
+            node_ids=right_ids,
+            edge_index=edge_index,
+            seq_features=seq_features,
+            adj_list=adj_list,
+            num_neighbors=num_neighbors,
+            batch_size=batch_size,
+            device=device,
+        )
+        left_emb = fuse_entity_outputs(left_outputs, fusion_weights)
+        right_emb = fuse_entity_outputs(right_outputs, fusion_weights)
 
     left_emb = F.normalize(left_emb, p=2, dim=-1)
     right_emb = F.normalize(right_emb, p=2, dim=-1)

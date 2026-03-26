@@ -28,7 +28,7 @@ class Config:
     raw_split: str = "0_3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     val_ratio: float = 0.1
-    al_pool_ratio: float = 0.05
+    al_pool_ratio: float = 0.15
 
     # =========================
     # Training
@@ -43,6 +43,13 @@ class Config:
 
     lr: float = 1e-3
     weight_decay: float = 1e-5
+    use_final_weight_averaging: bool = False
+    weight_average_last_k: int = 5
+    use_ema_eval: bool = False
+    ema_decay: float = 0.90
+    ema_start_epoch: int = 20
+    eval_fusion: bool = False
+    eval_fusion_weights: Tuple[float, float, float] = (0.7, 0.15, 0.15)
 
     # =========================
     # Model
@@ -81,17 +88,21 @@ class Config:
     lambda_sem: float = 0.2
     lambda_neg: float = 0.3
     lambda_ranking: float = 0.05
-    lambda_topology: float = 0.00
+    lambda_topology: float = 0.03
     branch_align_start: float = 0.15
     branch_align_end: float = 0.50
     cross_modal_start: float = 0.25
     cross_modal_end: float = 0.65
     joint_branch_start: float = 0.40
     joint_branch_end: float = 0.80
+    topology_start: float = 0.55
+    topology_end: float = 0.90
 
     temperature: float = 0.07
     margin: float = 0.2
     hard_negative_weight: float = 2.0
+    use_pairwise_hard_neg: bool = False
+    per_pair_hard_neg: bool = False
 
     # =========================
     # Negative sampling
@@ -103,6 +114,7 @@ class Config:
     global_hard_topk: int = 20
     global_hard_topk_max: int = 50
     use_global_hard_neg: bool = True
+    global_hard_start_epoch: int = 1
     num_conflict_neg: int = 0
     memory_bank_epochs: int = 2
 
@@ -111,15 +123,22 @@ class Config:
     # =========================
     do_active_learning: bool = True
     al_rounds: int = 2
-    al_budget: int = 30
+    al_budget: int = 120
     al_every_epochs: int = 8
     al_require_bidirectional: bool = True
-    al_min_confidence: float = 0.35
+    al_min_confidence: float = 0.40
     al_min_margin: float = 0.03
     al_min_uncertainty: float = 0.00
     al_max_uncertainty: float = 0.85
     al_negative_batch_size: int = 32
     al_negative_weight: float = 1.0
+    al_pool_negatives_per_left: int = 5
+    al_pool_use_full_candidates: bool = True
+    al_block_size: int = 1024
+    al_alpha_uncertainty: float = 0.35
+    al_alpha_repr: float = 0.65
+    al_use_diversity: bool = True
+    al_max_filter_stage: str = "score_only"
 
     # =========================
     # Misc
@@ -154,6 +173,17 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def parse_bool_env(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apply_optional_env(cfg: Config, env_name: str, attr: str, cast) -> None:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return
+    setattr(cfg, attr, cast(env_value))
+
+
 def apply_runtime_overrides(cfg: Config) -> None:
     seed_env = os.environ.get("KG_ALIGN_SEED")
     if seed_env is not None:
@@ -165,7 +195,7 @@ def apply_runtime_overrides(cfg: Config) -> None:
 
     al_env = os.environ.get("KG_ALIGN_AL")
     if al_env is not None:
-        cfg.do_active_learning = al_env.strip().lower() in {"1", "true", "yes", "on"}
+        cfg.do_active_learning = parse_bool_env(al_env)
 
     data_source_env = os.environ.get("KG_ALIGN_DATA_SOURCE")
     if data_source_env:
@@ -174,6 +204,162 @@ def apply_runtime_overrides(cfg: Config) -> None:
     ce_ratio_env = os.environ.get("KG_ALIGN_CE_RATIO")
     if ce_ratio_env is not None:
         cfg.ce_residual_ratio = float(ce_ratio_env)
+
+    eval_fusion_env = os.environ.get("KG_ALIGN_EVAL_FUSION")
+    if eval_fusion_env is not None:
+        cfg.eval_fusion = parse_bool_env(eval_fusion_env)
+
+    eval_weights_env = os.environ.get("KG_ALIGN_EVAL_WEIGHTS")
+    if eval_weights_env:
+        parts = [p.strip() for p in eval_weights_env.split(",") if p.strip()]
+        if len(parts) == 3:
+            cfg.eval_fusion_weights = (float(parts[0]), float(parts[1]), float(parts[2]))
+
+    seed_env = os.environ.get("KG_ALIGN_SEED")
+    if seed_env is not None:
+        try:
+            cfg.seed = int(seed_env)
+        except ValueError:
+            raise ValueError(f"KG_ALIGN_SEED must be an int, got: {seed_env}")
+
+    per_pair_env = os.environ.get("KG_ALIGN_PER_PAIR_HARD_NEG")
+    if per_pair_env is not None:
+        cfg.per_pair_hard_neg = parse_bool_env(per_pair_env)
+
+    if cfg.data_source == "raw_split":
+        # Treat the official DBP15K 0_3 protocol as a separate experimental
+        # regime. It has much less supervision than the fixed split setting, so
+        # we train longer, lower the learning rate, and make the collaborative
+        # objectives ramp up later.
+        cfg.warmup_epochs = 3
+        cfg.joint_epochs = 36
+        cfg.lr = 5e-4
+        cfg.use_final_weight_averaging = True
+        cfg.weight_average_last_k = 10
+        cfg.use_ema_eval = False
+        cfg.ema_decay = 0.90
+        cfg.ema_start_epoch = 20
+        cfg.lambda_branch_align = 0.15
+        cfg.branch_align_start = 0.25
+        cfg.branch_align_end = 0.65
+        cfg.cross_modal_start = 0.40
+        cfg.cross_modal_end = 0.80
+        cfg.joint_branch_start = 0.55
+        cfg.joint_branch_end = 0.90
+        cfg.topology_start = 0.70
+        cfg.topology_end = 0.98
+        cfg.lambda_cross_modal = 0.005
+        cfg.lambda_joint_branch = 0.01
+        # Raw-split experiments are sensitive to extra structural regularization.
+        # Keep topology matching available for manual sweeps, but do not enable
+        # it by default in the low-supervision setting.
+        cfg.lambda_topology = 0.00
+        # Baseline-first protocol: keep active learning off by default while we
+        # strengthen the main supervised alignment path. It can still be
+        # re-enabled explicitly via KG_ALIGN_AL=1 for follow-up experiments.
+        cfg.do_active_learning = False
+        cfg.ce_residual_ratio = 0.10
+        cfg.num_global_hard_neg = 2
+        cfg.global_hard_topk_max = 50
+        cfg.use_pairwise_hard_neg = False
+        cfg.per_pair_hard_neg = False
+
+        # Use weaker branch-to-joint consistency so the structural/semantic
+        # branches keep more complementarity instead of collapsing too
+        # aggressively toward the joint space.
+        cfg.lambda_struct = 0.05
+        cfg.lambda_sem = 0.05
+
+        # In raw-split the model is already quite stable, so repeated runs with
+        # the same seed mostly collapse to the same optimum. We therefore make
+        # active learning more conservative by delaying it, shrinking the
+        # budget, and disallowing low-quality non-reciprocal fallback stages.
+        #
+        # Important protocol choice: for raw-split experiments we no longer use
+        # the official test split as an oracle annotation pool. Instead, we hold
+        # out a small slice of the training supervision as the AL pool so the
+        # active-learning loop stays within the training regime.
+        cfg.al_pool_ratio = 0.05
+        cfg.al_rounds = 2
+        cfg.al_budget = 80
+        cfg.al_every_epochs = 12
+        cfg.al_min_confidence = 0.50
+        cfg.al_min_margin = 0.05
+        cfg.al_negative_weight = 0.60
+        cfg.al_alpha_uncertainty = 0.25
+        cfg.al_alpha_repr = 0.75
+        cfg.al_max_filter_stage = "reciprocal_relaxed_margin"
+
+    apply_optional_env(cfg, "KG_ALIGN_BATCH_SIZE", "batch_size", int)
+    apply_optional_env(cfg, "KG_ALIGN_EVAL_BATCH_SIZE", "eval_batch_size", int)
+    apply_optional_env(cfg, "KG_ALIGN_WARMUP_EPOCHS", "warmup_epochs", int)
+    apply_optional_env(cfg, "KG_ALIGN_JOINT_EPOCHS", "joint_epochs", int)
+    apply_optional_env(cfg, "KG_ALIGN_LR", "lr", float)
+    apply_optional_env(cfg, "KG_ALIGN_WEIGHT_DECAY", "weight_decay", float)
+    apply_optional_env(cfg, "KG_ALIGN_TEMPERATURE", "temperature", float)
+    apply_optional_env(cfg, "KG_ALIGN_MARGIN", "margin", float)
+    apply_optional_env(cfg, "KG_ALIGN_WEIGHT_AVG_LAST_K", "weight_average_last_k", int)
+    apply_optional_env(cfg, "KG_ALIGN_NUM_RANDOM_NEG", "num_random_neg", int)
+    apply_optional_env(cfg, "KG_ALIGN_NUM_HARD_NEG", "num_hard_neg", int)
+    apply_optional_env(cfg, "KG_ALIGN_HARD_TOPK", "hard_topk", int)
+    apply_optional_env(cfg, "KG_ALIGN_NUM_GLOBAL_HARD_NEG", "num_global_hard_neg", int)
+    apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_TOPK", "global_hard_topk", int)
+    apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_TOPK_MAX", "global_hard_topk_max", int)
+    apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_START", "global_hard_start_epoch", int)
+    apply_optional_env(cfg, "KG_ALIGN_MEMORY_BANK_EPOCHS", "memory_bank_epochs", int)
+    apply_optional_env(cfg, "KG_ALIGN_NUM_CONFLICT_NEG", "num_conflict_neg", int)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_BRANCH", "lambda_branch_align", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_CROSS", "lambda_cross_modal", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_JOINT_BRANCH", "lambda_joint_branch", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_STRUCT", "lambda_struct", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_SEM", "lambda_sem", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_NEG", "lambda_neg", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_RANKING", "lambda_ranking", float)
+    apply_optional_env(cfg, "KG_ALIGN_LAMBDA_TOPOLOGY", "lambda_topology", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_ROUNDS", "al_rounds", int)
+    apply_optional_env(cfg, "KG_ALIGN_AL_BUDGET", "al_budget", int)
+    apply_optional_env(cfg, "KG_ALIGN_AL_EVERY_EPOCHS", "al_every_epochs", int)
+    apply_optional_env(cfg, "KG_ALIGN_AL_POOL_RATIO", "al_pool_ratio", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_POOL_NEG_PER_LEFT", "al_pool_negatives_per_left", int)
+    apply_optional_env(cfg, "KG_ALIGN_AL_MIN_CONF", "al_min_confidence", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_MIN_MARGIN", "al_min_margin", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_MIN_UNCERTAINTY", "al_min_uncertainty", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_MAX_UNCERTAINTY", "al_max_uncertainty", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_NEG_BATCH", "al_negative_batch_size", int)
+    apply_optional_env(cfg, "KG_ALIGN_AL_NEG_WEIGHT", "al_negative_weight", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_ALPHA_UNCERTAINTY", "al_alpha_uncertainty", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_ALPHA_REPR", "al_alpha_repr", float)
+    apply_optional_env(cfg, "KG_ALIGN_AL_MAX_STAGE", "al_max_filter_stage", str)
+
+    use_global_hard_env = os.environ.get("KG_ALIGN_USE_GLOBAL_HARD_NEG")
+    if use_global_hard_env is not None:
+        cfg.use_global_hard_neg = parse_bool_env(use_global_hard_env)
+
+    use_weight_avg_env = os.environ.get("KG_ALIGN_USE_WEIGHT_AVG")
+    if use_weight_avg_env is not None:
+        cfg.use_final_weight_averaging = parse_bool_env(use_weight_avg_env)
+
+    use_ema_env = os.environ.get("KG_ALIGN_USE_EMA")
+    if use_ema_env is not None:
+        cfg.use_ema_eval = parse_bool_env(use_ema_env)
+
+    al_diversity_env = os.environ.get("KG_ALIGN_AL_USE_DIVERSITY")
+    if al_diversity_env is not None:
+        cfg.al_use_diversity = parse_bool_env(al_diversity_env)
+
+    full_candidates_env = os.environ.get("KG_ALIGN_AL_FULL_CANDIDATES")
+    if full_candidates_env is not None:
+        cfg.al_pool_use_full_candidates = parse_bool_env(full_candidates_env)
+
+    require_bidir_env = os.environ.get("KG_ALIGN_AL_REQUIRE_BIDIRECTIONAL")
+    if require_bidir_env is not None:
+        cfg.al_require_bidirectional = parse_bool_env(require_bidir_env)
+
+    # Re-apply the top-level AL switch after raw-split profile defaults so
+    # baseline-first defaults do not block explicit follow-up AL experiments.
+    al_env = os.environ.get("KG_ALIGN_AL")
+    if al_env is not None:
+        cfg.do_active_learning = parse_bool_env(al_env)
 
 
 def split_pairs(
@@ -197,6 +383,50 @@ def split_pairs(
     return remain_pairs, holdout_pairs
 
 
+def snapshot_model_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def average_state_dicts(state_history: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    if not state_history:
+        raise ValueError("state_history must not be empty")
+
+    averaged_state = {}
+    for key in state_history[0].keys():
+        values = [state[key] for state in state_history]
+        first = values[0]
+        if torch.is_floating_point(first):
+            averaged_state[key] = torch.stack(values, dim=0).mean(dim=0)
+        else:
+            averaged_state[key] = first.clone()
+    return averaged_state
+
+
+def update_ema_state_dict(
+    ema_state: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    decay: float,
+) -> Dict[str, torch.Tensor]:
+    current_state = model.state_dict()
+    if ema_state is None:
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in current_state.items()
+        }
+
+    updated_state = {}
+    for key, value in current_state.items():
+        value_cpu = value.detach().cpu()
+        if torch.is_floating_point(value_cpu):
+            updated_state[key] = ema_state[key] * decay + value_cpu * (1.0 - decay)
+        else:
+            updated_state[key] = value_cpu.clone()
+    return updated_state
+
+
 def build_experiment_splits(
     train_pairs: List[Tuple[int, int]],
     test_pairs: List[Tuple[int, int]],
@@ -217,26 +447,59 @@ def build_experiment_splits(
         "train_pairs": train_pairs,
         "val_pairs": val_pairs,
         "al_pool_pairs": al_pool_pairs,
+        "al_pool_gold_pairs": list(al_pool_pairs),
+        "al_pool_left_ids": [],
+        "al_pool_right_ids": [],
         "test_pairs": list(test_pairs),
     }
 
 
 def build_protocol_splits(cfg: Config, train_pairs: List[Tuple[int, int]], test_pairs: List[Tuple[int, int]]) -> Dict[str, List[Tuple[int, int]]]:
-    val_ratio = cfg.val_ratio
-    al_pool_ratio = cfg.al_pool_ratio
-
     if cfg.data_source == "raw_split":
-        # Stay closer to the standard DBP15K split: keep most of the provided
-        # supervision in training and do not carve an extra AL pool by default.
-        val_ratio = min(val_ratio, 0.05)
-        if cfg.do_active_learning:
-            al_pool_ratio = 0.0
+        # Keep the official reference pairs exclusively for final testing.
+        # When active learning is enabled, reserve a small subset of the
+        # provided training supervision as the oracle annotation pool.
+        train_pairs = list(train_pairs)
+        if cfg.do_active_learning and cfg.al_pool_ratio > 0.0:
+            train_pairs, al_pool_gold_pairs = split_pairs(train_pairs, cfg.al_pool_ratio, cfg.seed + 1)
+            if cfg.al_pool_use_full_candidates:
+                al_pool_left_ids = sorted({l for l, _ in al_pool_gold_pairs})
+                al_pool_right_ids = sorted({r for _, r in al_pool_gold_pairs})
+                al_pool_pairs = []
+            else:
+                right_id_pool = sorted({r for _, r in al_pool_gold_pairs})
+                rng = random.Random(cfg.seed + 2)
+                pool_pairs = set()
+                for l, r_true in al_pool_gold_pairs:
+                    pool_pairs.add((l, r_true))
+                    for _ in range(cfg.al_pool_negatives_per_left):
+                        r_neg = rng.choice(right_id_pool)
+                        while r_neg == r_true:
+                            r_neg = rng.choice(right_id_pool)
+                        pool_pairs.add((l, r_neg))
+                al_pool_pairs = list(pool_pairs)
+                al_pool_left_ids = []
+                al_pool_right_ids = []
+        else:
+            al_pool_pairs = []
+            al_pool_gold_pairs = []
+            al_pool_left_ids = []
+            al_pool_right_ids = []
+        return {
+            "train_pairs": list(train_pairs),
+            "val_pairs": [],
+            "al_pool_pairs": list(al_pool_pairs),
+            "al_pool_gold_pairs": list(al_pool_gold_pairs),
+            "al_pool_left_ids": list(al_pool_left_ids),
+            "al_pool_right_ids": list(al_pool_right_ids),
+            "test_pairs": list(test_pairs),
+        }
 
     return build_experiment_splits(
         train_pairs=train_pairs,
         test_pairs=test_pairs,
-        val_ratio=val_ratio,
-        al_pool_ratio=al_pool_ratio,
+        val_ratio=cfg.val_ratio,
+        al_pool_ratio=cfg.al_pool_ratio,
         seed=cfg.seed,
         do_active_learning=cfg.do_active_learning,
     )
@@ -257,11 +520,16 @@ def build_fixed_eval_splits(
         "train_pairs": list(train_pairs),
         "val_pairs": list(val_pairs),
         "al_pool_pairs": list(al_pool_pairs),
+        "al_pool_gold_pairs": list(al_pool_pairs),
+        "al_pool_left_ids": [],
+        "al_pool_right_ids": [],
         "test_pairs": list(test_pairs),
     }
 
 
 def should_use_early_stopping(cfg: Config) -> bool:
+    if cfg.data_source == "raw_split":
+        return False
     return cfg.use_early_stopping
 
 
@@ -483,6 +751,7 @@ def train_one_epoch(
     total_branch_scale = 0.0
     total_cross_scale = 0.0
     total_joint_scale = 0.0
+    total_topology_scale = 0.0
     total_struct = 0.0
     total_sem = 0.0
     total_neg = 0.0
@@ -660,6 +929,8 @@ def train_one_epoch(
             cross_modal_end=cfg.cross_modal_end,
             joint_branch_start=cfg.joint_branch_start,
             joint_branch_end=cfg.joint_branch_end,
+            topology_start=cfg.topology_start,
+            topology_end=cfg.topology_end,
             temperature=cfg.temperature,
             neg_left_joint=neg_left_joint,
             neg_right_joint=neg_right_joint,
@@ -668,6 +939,8 @@ def train_one_epoch(
             margin=cfg.margin,
             hard_negative_weight=cfg.hard_negative_weight,
             al_negative_weight=cfg.al_negative_weight,
+            use_pairwise_hard_neg=cfg.use_pairwise_hard_neg,
+            per_pair_hard_neg=cfg.per_pair_hard_neg,
             warmup_mode=warmup_mode,
         )
 
@@ -683,6 +956,7 @@ def train_one_epoch(
         total_branch_scale += loss_dict["branch_align_scale"].item()
         total_cross_scale += loss_dict["cross_modal_scale"].item()
         total_joint_scale += loss_dict["joint_branch_scale"].item()
+        total_topology_scale += loss_dict["topology_scale"].item()
         total_struct += loss_dict["struct_loss"].item()
         total_sem += loss_dict["sem_loss"].item()
         total_neg += loss_dict["neg_loss"].item()
@@ -700,6 +974,7 @@ def train_one_epoch(
         "branch_align_scale": total_branch_scale / max(1, num_batches),
         "cross_modal_scale": total_cross_scale / max(1, num_batches),
         "joint_branch_scale": total_joint_scale / max(1, num_batches),
+        "topology_scale": total_topology_scale / max(1, num_batches),
         "struct_loss": total_struct / max(1, num_batches),
         "sem_loss": total_sem / max(1, num_batches),
         "neg_loss": total_neg / max(1, num_batches),
@@ -736,8 +1011,13 @@ def main():
     train_pairs = splits["train_pairs"]
     val_pairs = splits["val_pairs"]
     al_pool_pairs = splits["al_pool_pairs"]
+    al_pool_gold_pairs = splits.get("al_pool_gold_pairs", al_pool_pairs)
+    al_pool_left_ids = splits.get("al_pool_left_ids", [])
+    al_pool_right_ids = splits.get("al_pool_right_ids", [])
     test_pairs = splits["test_pairs"]
-    val_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, val_pairs)
+    val_candidate_right_ids = None
+    if val_pairs:
+        val_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, val_pairs)
     test_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, test_pairs)
 
     # 用 CPU 上的 edge_index 建邻接表，避免 GPU tensor 转 list 问题
@@ -748,12 +1028,21 @@ def main():
     if cfg.data_source == "raw_split":
         print(f"Raw split: {cfg.raw_split}")
     print(f"Experiment: {cfg.experiment_tag}")
+    print(f"Seed: {cfg.seed}")
     print(f"Total nodes: {total_nodes}")
     print(f"Edges total: {edge_index.size(1)}")
     print(f"Train pairs: {len(train_pairs)}")
     print(f"Val pairs: {len(val_pairs)}")
-    print(f"AL pool pairs: {len(al_pool_pairs)}")
+    if al_pool_left_ids and al_pool_right_ids:
+        print(
+            f"AL pool pairs: {len(al_pool_left_ids)} x {len(al_pool_right_ids)} "
+            "(full candidates)"
+        )
+    else:
+        print(f"AL pool pairs: {len(al_pool_pairs)}")
     print(f"Test pairs: {len(test_pairs)}")
+    if cfg.data_source == "raw_split" and cfg.do_active_learning:
+        print("AL pool source: held-out training supervision")
     print(f"Sequence features: {tuple(seq_features.shape)}")
     print(
         "Ablation switches: "
@@ -769,6 +1058,7 @@ def main():
         f"global_hard={cfg.num_global_hard_neg}, "
         f"conflict={cfg.num_conflict_neg}, "
         f"global_topk={cfg.global_hard_topk}->{cfg.global_hard_topk_max}, "
+        f"global_start={cfg.global_hard_start_epoch}, "
         f"bank_epochs={cfg.memory_bank_epochs}, "
         f"use_global_hard={cfg.use_global_hard_neg}"
     )
@@ -778,7 +1068,7 @@ def main():
         f"cross={cfg.lambda_cross_modal} [{cfg.cross_modal_start:.2f},{cfg.cross_modal_end:.2f}], "
         f"joint_branch={cfg.lambda_joint_branch} [{cfg.joint_branch_start:.2f},{cfg.joint_branch_end:.2f}], "
         f"ranking={cfg.lambda_ranking:.2f}, "
-        f"topology={cfg.lambda_topology:.2f}"
+        f"topology={cfg.lambda_topology:.2f} [{cfg.topology_start:.2f},{cfg.topology_end:.2f}]"
     )
     print(
         "Structural encoder switches: "
@@ -792,13 +1082,30 @@ def main():
         f"min_conf={cfg.al_min_confidence:.2f}, "
         f"min_margin={cfg.al_min_margin:.2f}, "
         f"min_unc={cfg.al_min_uncertainty:.2f}, "
-        f"max_unc={cfg.al_max_uncertainty:.2f}"
+        f"max_unc={cfg.al_max_uncertainty:.2f}, "
+        f"max_stage={cfg.al_max_filter_stage}"
     )
     print(
         "Active learning negatives: "
         f"batch_size={cfg.al_negative_batch_size}, "
         f"weight={cfg.al_negative_weight:.2f}"
     )
+    if cfg.eval_fusion:
+        w_joint, w_struct, w_sem = cfg.eval_fusion_weights
+        print(
+            f"Eval fusion: joint={w_joint:.2f}, "
+            f"struct={w_struct:.2f}, sem={w_sem:.2f}"
+        )
+    if cfg.use_ema_eval:
+        print(
+            f"Final weight strategy: EMA "
+            f"(decay={cfg.ema_decay:.2f}, start_epoch={cfg.ema_start_epoch})"
+        )
+    elif cfg.use_final_weight_averaging:
+        print(
+            f"Final weight strategy: average_last_k "
+            f"(k={cfg.weight_average_last_k})"
+        )
     print(f"Early stopping enabled: {should_use_early_stopping(cfg)}")
 
     model = build_model(cfg, total_nodes=total_nodes).to(device)
@@ -807,6 +1114,13 @@ def main():
         lr=cfg.lr,
         weight_decay=cfg.weight_decay
     )
+    joint_scheduler = None
+    if cfg.data_source == "raw_split":
+        joint_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.joint_epochs,
+            eta_min=cfg.lr * 0.2,
+        )
 
     best_hits1 = -1.0
     best_path = os.path.join(cfg.save_dir, f"best_model_{cfg.pair}_{cfg.experiment_tag}.pt")
@@ -817,6 +1131,7 @@ def main():
     # =========================
     print("\n===== Stage 1: Warmup =====")
     warmup_loader = make_loader(train_pairs, cfg.batch_size, shuffle=True)
+    fusion_weights = cfg.eval_fusion_weights if cfg.eval_fusion else None
 
     for epoch in range(1, cfg.warmup_epochs + 1):
         train_stats = train_one_epoch(
@@ -832,27 +1147,36 @@ def main():
             warmup_mode=True,
         )
 
-        metrics = evaluate_alignment(
-            model=model,
-            edge_index=edge_index,
-            seq_features=seq_features,
-            adj_list=adj_list,
-            num_neighbors=cfg.num_neighbors,
-            test_pairs=val_pairs,
-            candidate_right_ids=val_candidate_right_ids,
-            batch_size=cfg.eval_batch_size,
-            device=device,
-        )
+        if val_pairs:
+            metrics = evaluate_alignment(
+                model=model,
+                edge_index=edge_index,
+                seq_features=seq_features,
+                adj_list=adj_list,
+                num_neighbors=cfg.num_neighbors,
+                test_pairs=val_pairs,
+                candidate_right_ids=val_candidate_right_ids,
+                batch_size=cfg.eval_batch_size,
+                device=device,
+                fusion_weights=fusion_weights,
+            )
 
-        print(
-            f"[Warmup] Epoch {epoch:03d} | "
-            f"Loss: {train_stats['loss']:.4f} | "
-            f"Struct: {train_stats['struct_loss']:.4f} | "
-            f"Topo: {train_stats['topology_loss']:.4f} | "
-            f"ValHits@1: {metrics['Hits@1']:.4f} | "
-            f"ValHits@10: {metrics['Hits@10']:.4f} | "
-            f"ValMRR: {metrics['MRR']:.4f}"
-        )
+            print(
+                f"[Warmup] Epoch {epoch:03d} | "
+                f"Loss: {train_stats['loss']:.4f} | "
+                f"Struct: {train_stats['struct_loss']:.4f} | "
+                f"Topo: {train_stats['topology_loss']:.4f} | "
+                f"ValHits@1: {metrics['Hits@1']:.4f} | "
+                f"ValHits@10: {metrics['Hits@10']:.4f} | "
+                f"ValMRR: {metrics['MRR']:.4f}"
+            )
+        else:
+            print(
+                f"[Warmup] Epoch {epoch:03d} | "
+                f"Loss: {train_stats['loss']:.4f} | "
+                f"Struct: {train_stats['struct_loss']:.4f} | "
+                f"Topo: {train_stats['topology_loss']:.4f}"
+            )
 
     # =========================
     # Stage 2: Joint Training
@@ -862,18 +1186,23 @@ def main():
     queried_al_pairs = set()
     al_negative_pairs = []
     negative_bank_history = []
+    weight_average_history = []
+    ema_state = None
+    ema_updates = 0
     early_stop_counter = 0
 
     for epoch in range(1, cfg.joint_epochs + 1):
         train_loader = make_loader(train_pairs, cfg.batch_size, shuffle=True)
         negative_bank = None
-        dynamic_global_topk = get_dynamic_topk(
-            epoch=epoch,
-            total_epochs=cfg.joint_epochs,
-            base_topk=cfg.global_hard_topk,
-            max_topk=cfg.global_hard_topk_max,
-        )
-        if cfg.use_global_hard_neg:
+        dynamic_global_topk = 0
+        global_hard_active = cfg.use_global_hard_neg and epoch >= cfg.global_hard_start_epoch
+        if global_hard_active:
+            dynamic_global_topk = get_dynamic_topk(
+                epoch=epoch,
+                total_epochs=cfg.joint_epochs,
+                base_topk=cfg.global_hard_topk,
+                max_topk=cfg.global_hard_topk_max,
+            )
             current_bank = build_global_negative_cache(
                 model=model,
                 edge_index=edge_index,
@@ -905,57 +1234,77 @@ def main():
             warmup_mode=False,
         )
 
-        metrics = evaluate_alignment(
-            model=model,
-            edge_index=edge_index,
-            seq_features=seq_features,
-            adj_list=adj_list,
-            num_neighbors=cfg.num_neighbors,
-            test_pairs=val_pairs,
-            candidate_right_ids=val_candidate_right_ids,
-            batch_size=cfg.eval_batch_size,
-            device=device,
-        )
-
-        print(
-            f"[Joint ] Epoch {epoch:03d} | "
-            f"Loss: {train_stats['loss']:.4f} | "
-            f"Align: {train_stats['align_loss']:.4f} | "
-            f"Branch: {train_stats['branch_align_loss']:.4f}({train_stats['branch_align_scale']:.2f}) | "
-            f"Cross: {train_stats['cross_modal_loss']:.4f}({train_stats['cross_modal_scale']:.2f}) | "
-            f"JointBr: {train_stats['joint_branch_loss']:.4f}({train_stats['joint_branch_scale']:.2f}) | "
-            f"Struct: {train_stats['struct_loss']:.4f} | "
-            f"Sem: {train_stats['sem_loss']:.4f} | "
-            f"Neg: {train_stats['neg_loss']:.4f} | "
-            f"ALNeg: {train_stats['al_neg_loss']:.4f} | "
-            f"Rank: {train_stats['ranking_loss']:.4f} | "
-            f"Topo: {train_stats['topology_loss']:.4f} | "
-            f"TopK: {dynamic_global_topk} | "
-            f"ValHits@1: {metrics['Hits@1']:.4f} | "
-            f"ValHits@10: {metrics['Hits@10']:.4f} | "
-            f"ValMRR: {metrics['MRR']:.4f}"
-        )
-
-        if metrics["Hits@1"] > best_hits1 + cfg.early_stop_min_delta:
-            best_hits1 = metrics["Hits@1"]
-            early_stop_counter = 0
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": cfg.__dict__,
-                },
-                best_path,
+        if val_pairs:
+            metrics = evaluate_alignment(
+                model=model,
+                edge_index=edge_index,
+                seq_features=seq_features,
+                adj_list=adj_list,
+                num_neighbors=cfg.num_neighbors,
+                test_pairs=val_pairs,
+                candidate_right_ids=val_candidate_right_ids,
+                batch_size=cfg.eval_batch_size,
+                device=device,
+                fusion_weights=fusion_weights,
             )
-            print(f"Saved best model to {best_path}")
-        else:
-            early_stop_counter += 1
 
-        if early_stopping_enabled and early_stop_counter >= cfg.early_stop_patience:
             print(
-                f"Early stopping triggered at joint epoch {epoch:03d} "
-                f"(best Hits@1={best_hits1:.4f})"
+                f"[Joint ] Epoch {epoch:03d} | "
+                f"Loss: {train_stats['loss']:.4f} | "
+                f"Align: {train_stats['align_loss']:.4f} | "
+                f"Branch: {train_stats['branch_align_loss']:.4f}({train_stats['branch_align_scale']:.2f}) | "
+                f"Cross: {train_stats['cross_modal_loss']:.4f}({train_stats['cross_modal_scale']:.2f}) | "
+                f"JointBr: {train_stats['joint_branch_loss']:.4f}({train_stats['joint_branch_scale']:.2f}) | "
+                f"Struct: {train_stats['struct_loss']:.4f} | "
+                f"Sem: {train_stats['sem_loss']:.4f} | "
+                f"Neg: {train_stats['neg_loss']:.4f} | "
+                f"ALNeg: {train_stats['al_neg_loss']:.4f} | "
+                f"Rank: {train_stats['ranking_loss']:.4f} | "
+                f"Topo: {train_stats['topology_loss']:.4f}({train_stats['topology_scale']:.2f}) | "
+                f"TopK: {dynamic_global_topk} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.6f} | "
+                f"ValHits@1: {metrics['Hits@1']:.4f} | "
+                f"ValHits@10: {metrics['Hits@10']:.4f} | "
+                f"ValMRR: {metrics['MRR']:.4f}"
             )
-            break
+
+            if metrics["Hits@1"] > best_hits1 + cfg.early_stop_min_delta:
+                best_hits1 = metrics["Hits@1"]
+                early_stop_counter = 0
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": cfg.__dict__,
+                    },
+                    best_path,
+                )
+                print(f"Saved best model to {best_path}")
+            else:
+                early_stop_counter += 1
+
+            if early_stopping_enabled and early_stop_counter >= cfg.early_stop_patience:
+                print(
+                    f"Early stopping triggered at joint epoch {epoch:03d} "
+                    f"(best Hits@1={best_hits1:.4f})"
+                )
+                break
+        else:
+            print(
+                f"[Joint ] Epoch {epoch:03d} | "
+                f"Loss: {train_stats['loss']:.4f} | "
+                f"Align: {train_stats['align_loss']:.4f} | "
+                f"Branch: {train_stats['branch_align_loss']:.4f}({train_stats['branch_align_scale']:.2f}) | "
+                f"Cross: {train_stats['cross_modal_loss']:.4f}({train_stats['cross_modal_scale']:.2f}) | "
+                f"JointBr: {train_stats['joint_branch_loss']:.4f}({train_stats['joint_branch_scale']:.2f}) | "
+                f"Struct: {train_stats['struct_loss']:.4f} | "
+                f"Sem: {train_stats['sem_loss']:.4f} | "
+                f"Neg: {train_stats['neg_loss']:.4f} | "
+                f"ALNeg: {train_stats['al_neg_loss']:.4f} | "
+                f"Rank: {train_stats['ranking_loss']:.4f} | "
+                f"Topo: {train_stats['topology_loss']:.4f}({train_stats['topology_scale']:.2f}) | "
+                f"TopK: {dynamic_global_topk} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+            )
 
         # =========================
         # Optional Active Learning
@@ -973,6 +1322,9 @@ def main():
                 adj_list=adj_list,
                 train_pairs=train_pairs,
                 pool_pairs=al_pool_pairs,
+                gold_pairs=al_pool_gold_pairs,
+                pool_left_ids=al_pool_left_ids,
+                pool_right_ids=al_pool_right_ids,
                 queried_pairs=queried_al_pairs,
                 device=device,
             )
@@ -984,7 +1336,9 @@ def main():
             print(
                 f"[AL    ] Round {al_round_done:02d} | "
                 f"Candidates: {al_stats['candidates']} | "
+                f"Strict: {al_stats['strict_filtered_candidates']} | "
                 f"Filtered: {al_stats['filtered_candidates']} | "
+                f"Stage: {al_stats['filter_stage']} | "
                 f"NewPos: {al_stats['new_positive']} | "
                 f"NewNeg: {al_stats['new_negative']} | "
                 f"Added: {al_stats['added_to_train']} | "
@@ -997,12 +1351,68 @@ def main():
                 f"ALNegPool: {len(al_negative_pairs)}"
             )
 
-    print("\nTraining finished.")
-    print(f"Best Hits@1: {best_hits1:.4f}")
+        if (
+            cfg.use_final_weight_averaging
+            and epoch >= max(1, cfg.joint_epochs - cfg.weight_average_last_k + 1)
+        ):
+            weight_average_history.append(snapshot_model_state_dict(model))
+            weight_average_history = weight_average_history[-cfg.weight_average_last_k:]
 
-    if os.path.exists(best_path):
-        checkpoint = torch.load(best_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        if cfg.use_ema_eval and epoch >= cfg.ema_start_epoch:
+            ema_state = update_ema_state_dict(ema_state, model, cfg.ema_decay)
+            ema_updates += 1
+
+        if joint_scheduler is not None:
+            joint_scheduler.step()
+
+    print("\nTraining finished.")
+    if val_pairs:
+        print(f"Best Hits@1: {best_hits1:.4f}")
+
+        if os.path.exists(best_path):
+            checkpoint = torch.load(best_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            final_test_metrics = evaluate_alignment(
+                model=model,
+                edge_index=edge_index,
+                seq_features=seq_features,
+                adj_list=adj_list,
+                num_neighbors=cfg.num_neighbors,
+                test_pairs=test_pairs,
+                candidate_right_ids=test_candidate_right_ids,
+                batch_size=cfg.eval_batch_size,
+                device=device,
+                fusion_weights=fusion_weights,
+            )
+            print(
+                "Final test metrics from best validation checkpoint | "
+                f"Hits@1: {final_test_metrics['Hits@1']:.4f} | "
+                f"Hits@10: {final_test_metrics['Hits@10']:.4f} | "
+                f"MRR: {final_test_metrics['MRR']:.4f}"
+            )
+    else:
+        if cfg.use_ema_eval and ema_state is not None:
+            model.load_state_dict(ema_state)
+            print(
+                f"Applied EMA weights with decay={cfg.ema_decay:.2f} "
+                f"from joint epoch {cfg.ema_start_epoch} "
+                f"(updates={ema_updates})"
+            )
+        elif cfg.use_final_weight_averaging and len(weight_average_history) > 1:
+            averaged_state = average_state_dicts(weight_average_history)
+            model.load_state_dict(averaged_state)
+            print(
+                f"Applied final weight averaging over the last "
+                f"{len(weight_average_history)} joint epochs"
+            )
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "config": cfg.__dict__,
+            },
+            best_path,
+        )
+        print(f"Saved final model to {best_path}")
         final_test_metrics = evaluate_alignment(
             model=model,
             edge_index=edge_index,
@@ -1013,9 +1423,10 @@ def main():
             candidate_right_ids=test_candidate_right_ids,
             batch_size=cfg.eval_batch_size,
             device=device,
+            fusion_weights=fusion_weights,
         )
         print(
-            "Final test metrics from best validation checkpoint | "
+            "Final test metrics after fixed-epoch training | "
             f"Hits@1: {final_test_metrics['Hits@1']:.4f} | "
             f"Hits@10: {final_test_metrics['Hits@10']:.4f} | "
             f"MRR: {final_test_metrics['MRR']:.4f}"
