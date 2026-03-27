@@ -31,6 +31,22 @@ def reshape_sampled_negative_sim(
     return neg_sim[:usable].view(batch_size, -1)
 
 
+def stable_topk_mean(values: torch.Tensor, topk: int, dim: int = -1) -> torch.Tensor:
+    if values.numel() == 0:
+        raise ValueError("stable_topk_mean requires a non-empty tensor")
+
+    size = values.size(dim)
+    if size <= 0:
+        raise ValueError("stable_topk_mean requires a positive-sized dimension")
+
+    k = max(1, min(topk, size))
+    safe_values = values.masked_fill(~torch.isfinite(values), float("-inf"))
+    topk_values = safe_values.topk(k=k, dim=dim).values
+    finite_mask = torch.isfinite(topk_values)
+    denom = finite_mask.sum(dim=dim).clamp_min(1)
+    return topk_values.masked_fill(~finite_mask, 0.0).sum(dim=dim) / denom
+
+
 def info_nce_loss(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -109,6 +125,7 @@ def margin_based_negative_loss(
     margin: float = 0.2,
     hard_weight: float = 1.0,
     per_pair_hard: bool = False,
+    stable_topk: int = 1,
 ) -> torch.Tensor:
     """
     一个轻量可运行版负样本损失：
@@ -127,7 +144,7 @@ def margin_based_negative_loss(
 
     if neg_per is not None:
         if per_pair_hard:
-            hard_neg = neg_per.max(dim=1).values
+            hard_neg = stable_topk_mean(neg_per, topk=stable_topk, dim=1)
             loss = F.relu(margin - pos_sim + hard_neg).mean()
         else:
             pos_ref = pos_sim.unsqueeze(1)
@@ -135,8 +152,9 @@ def margin_based_negative_loss(
     else:
         # Fallback to global reference when the shapes do not align.
         neg_sim = cosine_sim(neg_left, neg_right)   # [K]
+        hard_neg = stable_topk_mean(neg_sim, topk=stable_topk, dim=0)
         pos_ref = pos_sim.mean()
-        loss = F.relu(margin - pos_ref + neg_sim).mean()
+        loss = F.relu(margin - pos_ref + hard_neg).mean()
     return hard_weight * loss
 
 
@@ -166,6 +184,8 @@ def hardest_negative_ranking_loss(
     margin: float = 0.2,
     sampled_neg_left: torch.Tensor = None,
     sampled_neg_right: torch.Tensor = None,
+    batch_topk: int = 1,
+    sampled_topk: int = 1,
 ) -> torch.Tensor:
     """
     Encourage the gold pair to outrank the hardest in-batch impostor on both
@@ -184,8 +204,8 @@ def hardest_negative_ranking_loss(
     if pos_left.size(0) > 1:
         mask = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
         neg_sim = sim.masked_fill(mask, float("-inf"))
-        hardest_right = neg_sim.max(dim=1).values
-        hardest_left = neg_sim.max(dim=0).values
+        hardest_right = stable_topk_mean(neg_sim, topk=batch_topk, dim=1)
+        hardest_left = stable_topk_mean(neg_sim, topk=batch_topk, dim=0)
         hardest_any = torch.maximum(hardest_right, hardest_left)
 
     sampled_neg_per = reshape_sampled_negative_sim(
@@ -194,7 +214,7 @@ def hardest_negative_ranking_loss(
         neg_right=sampled_neg_right,
     )
     if sampled_neg_per is not None:
-        sampled_hardest = sampled_neg_per.max(dim=1).values
+        sampled_hardest = stable_topk_mean(sampled_neg_per, topk=sampled_topk, dim=1)
         hardest_any = torch.maximum(hardest_any, sampled_hardest)
 
     valid_mask = hardest_any > -1e8
@@ -272,6 +292,8 @@ def total_loss(
     al_negative_weight: float = 1.0,
     use_pairwise_hard_neg: bool = False,
     per_pair_hard_neg: bool = False,
+    stable_neg_topk: int = 1,
+    stable_ranking_topk: int = 1,
     warmup_mode: bool = False,
 ):
     """
@@ -377,6 +399,7 @@ def total_loss(
             margin=margin,
             hard_weight=hard_negative_weight,
             per_pair_hard=per_pair_hard_neg,
+            stable_topk=stable_neg_topk,
         )
 
     al_neg_loss = explicit_negative_pair_loss(
@@ -391,6 +414,8 @@ def total_loss(
         margin=margin,
         sampled_neg_left=neg_left_joint,
         sampled_neg_right=neg_right_joint,
+        batch_topk=stable_ranking_topk,
+        sampled_topk=stable_ranking_topk,
     )
 
     topology_loss = topology_matching_loss(

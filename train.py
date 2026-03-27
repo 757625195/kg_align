@@ -103,6 +103,8 @@ class Config:
     hard_negative_weight: float = 2.0
     use_pairwise_hard_neg: bool = False
     per_pair_hard_neg: bool = False
+    stable_neg_topk: int = 1
+    stable_ranking_topk: int = 1
 
     # =========================
     # Negative sampling
@@ -115,6 +117,7 @@ class Config:
     global_hard_topk_max: int = 50
     use_global_hard_neg: bool = True
     global_hard_start_epoch: int = 1
+    global_hard_reciprocal_guard_topk: int = 0
     num_conflict_neg: int = 0
     memory_bank_epochs: int = 2
 
@@ -259,10 +262,25 @@ def apply_runtime_overrides(cfg: Config) -> None:
         # re-enabled explicitly via KG_ALIGN_AL=1 for follow-up experiments.
         cfg.do_active_learning = False
         cfg.ce_residual_ratio = 0.10
+        # Keep the raw-split baseline focused on the strongest confirmed gain
+        # so far (the upgraded text encoder). Hard-negative/ranking variants
+        # remain available through env overrides, but they are not enabled by
+        # default because they did not improve the single-seed baseline.
+        cfg.num_hard_neg = 2
+        cfg.hard_topk = 10
         cfg.num_global_hard_neg = 2
+        cfg.global_hard_topk = 20
         cfg.global_hard_topk_max = 50
+        cfg.global_hard_start_epoch = 1
+        cfg.global_hard_reciprocal_guard_topk = 0
+        cfg.memory_bank_epochs = 2
+        cfg.hard_negative_weight = 2.0
+        cfg.lambda_ranking = 0.05
         cfg.use_pairwise_hard_neg = False
-        cfg.per_pair_hard_neg = False
+        # Each positive pair focuses on its own hardest sampled negatives.
+        cfg.per_pair_hard_neg = True
+        cfg.stable_neg_topk = 1
+        cfg.stable_ranking_topk = 1
 
         # Use weaker branch-to-joint consistency so the structural/semantic
         # branches keep more complementarity instead of collapsing too
@@ -306,6 +324,12 @@ def apply_runtime_overrides(cfg: Config) -> None:
     apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_TOPK", "global_hard_topk", int)
     apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_TOPK_MAX", "global_hard_topk_max", int)
     apply_optional_env(cfg, "KG_ALIGN_GLOBAL_HARD_START", "global_hard_start_epoch", int)
+    apply_optional_env(
+        cfg,
+        "KG_ALIGN_GLOBAL_HARD_RECIP_GUARD_TOPK",
+        "global_hard_reciprocal_guard_topk",
+        int,
+    )
     apply_optional_env(cfg, "KG_ALIGN_MEMORY_BANK_EPOCHS", "memory_bank_epochs", int)
     apply_optional_env(cfg, "KG_ALIGN_NUM_CONFLICT_NEG", "num_conflict_neg", int)
     apply_optional_env(cfg, "KG_ALIGN_LAMBDA_BRANCH", "lambda_branch_align", float)
@@ -315,6 +339,8 @@ def apply_runtime_overrides(cfg: Config) -> None:
     apply_optional_env(cfg, "KG_ALIGN_LAMBDA_SEM", "lambda_sem", float)
     apply_optional_env(cfg, "KG_ALIGN_LAMBDA_NEG", "lambda_neg", float)
     apply_optional_env(cfg, "KG_ALIGN_LAMBDA_RANKING", "lambda_ranking", float)
+    apply_optional_env(cfg, "KG_ALIGN_STABLE_NEG_TOPK", "stable_neg_topk", int)
+    apply_optional_env(cfg, "KG_ALIGN_STABLE_RANKING_TOPK", "stable_ranking_topk", int)
     apply_optional_env(cfg, "KG_ALIGN_LAMBDA_TOPOLOGY", "lambda_topology", float)
     apply_optional_env(cfg, "KG_ALIGN_AL_ROUNDS", "al_rounds", int)
     apply_optional_env(cfg, "KG_ALIGN_AL_BUDGET", "al_budget", int)
@@ -720,6 +746,44 @@ def get_dynamic_topk(epoch: int, total_epochs: int, base_topk: int, max_topk: in
     return int(round(base_topk + (max_topk - base_topk) * ratio))
 
 
+def merge_negative_groups(*group_sources: List[List[Tuple[int, int]]]) -> List[List[Tuple[int, int]]]:
+    merged = None
+    for source in group_sources:
+        if source is None:
+            continue
+        if merged is None:
+            merged = [list(group) for group in source]
+            continue
+        if len(source) != len(merged):
+            raise ValueError("Negative group sources must have the same batch length")
+        for target_group, extra_group in zip(merged, source):
+            target_group.extend(extra_group)
+    return merged or []
+
+
+def flatten_negative_groups(
+    groups: List[List[Tuple[int, int]]]
+) -> List[Tuple[int, int]]:
+    if not groups:
+        return []
+
+    max_group_size = max(len(group) for group in groups)
+    if max_group_size <= 0:
+        return []
+
+    flat_pairs: List[Tuple[int, int]] = []
+    for group in groups:
+        if not group:
+            raise ValueError(
+                "per_pair_hard_neg requires at least one negative for every positive pair"
+            )
+        padded_group = list(group)
+        while len(padded_group) < max_group_size:
+            padded_group.append(padded_group[-1])
+        flat_pairs.extend(padded_group)
+    return flat_pairs
+
+
 def train_one_epoch(
     model: JointEAModel,
     loader: DataLoader,
@@ -798,12 +862,15 @@ def train_one_epoch(
             ))
 
             # 随机负样本
+            use_grouped_negs = cfg.per_pair_hard_neg
+
             rand_negs = random_negative_sampling(
                 batch_pairs=batch_pairs,
                 all_left_entities=all_left_entities,
                 all_right_entities=all_right_entities,
                 known_pairs=known_pair_set,
                 num_random_neg=cfg.num_random_neg,
+                return_grouped=use_grouped_negs,
             )
 
             # 难负样本（基于当前 batch joint embedding）
@@ -818,6 +885,7 @@ def train_one_epoch(
                 known_pairs=known_pair_set,
                 topk=cfg.hard_topk,
                 num_hard_neg=cfg.num_hard_neg,
+                return_grouped=use_grouped_negs,
             )
 
             global_hard_negs = []
@@ -833,9 +901,15 @@ def train_one_epoch(
                     joint_topk=dynamic_global_topk or cfg.global_hard_topk,
                     num_global_hard_neg=cfg.num_global_hard_neg,
                     num_conflict_neg=cfg.num_conflict_neg,
+                    reciprocal_guard_topk=cfg.global_hard_reciprocal_guard_topk,
+                    return_grouped=use_grouped_negs,
                 )
 
-            all_negs = rand_negs + hard_negs + global_hard_negs
+            if use_grouped_negs:
+                grouped_negs = merge_negative_groups(rand_negs, hard_negs, global_hard_negs)
+                all_negs = flatten_negative_groups(grouped_negs)
+            else:
+                all_negs = rand_negs + hard_negs + global_hard_negs
 
             if len(all_negs) > 0:
                 neg_left_ids = torch.tensor(
@@ -941,6 +1015,8 @@ def train_one_epoch(
             al_negative_weight=cfg.al_negative_weight,
             use_pairwise_hard_neg=cfg.use_pairwise_hard_neg,
             per_pair_hard_neg=cfg.per_pair_hard_neg,
+            stable_neg_topk=cfg.stable_neg_topk,
+            stable_ranking_topk=cfg.stable_ranking_topk,
             warmup_mode=warmup_mode,
         )
 
@@ -1059,8 +1135,12 @@ def main():
         f"conflict={cfg.num_conflict_neg}, "
         f"global_topk={cfg.global_hard_topk}->{cfg.global_hard_topk_max}, "
         f"global_start={cfg.global_hard_start_epoch}, "
+        f"recip_guard_topk={cfg.global_hard_reciprocal_guard_topk}, "
         f"bank_epochs={cfg.memory_bank_epochs}, "
-        f"use_global_hard={cfg.use_global_hard_neg}"
+        f"use_global_hard={cfg.use_global_hard_neg}, "
+        f"per_pair_hard={cfg.per_pair_hard_neg}, "
+        f"stable_neg_topk={cfg.stable_neg_topk}, "
+        f"stable_rank_topk={cfg.stable_ranking_topk}"
     )
     print(
         "Collaborative loss schedule: "

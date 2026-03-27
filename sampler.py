@@ -1,5 +1,5 @@
 import random
-from typing import Dict, List, Tuple, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -25,14 +25,17 @@ def random_negative_sampling(
     all_right_entities: List[int],
     known_pairs: Set[Tuple[int, int]],
     num_random_neg: int = 1,
+    return_grouped: bool = False,
 ):
     """
     对每个正样本 (l, r)，构造:
       (l, r_neg), (l_neg, r)
     """
     negatives = []
+    grouped_negatives = []
 
     for l, r in batch_pairs:
+        pair_negatives = []
         for _ in range(num_random_neg):
             # negative on right
             rr = random.choice(all_right_entities)
@@ -40,7 +43,7 @@ def random_negative_sampling(
             while (l, rr) in known_pairs and trial < 20:
                 rr = random.choice(all_right_entities)
                 trial += 1
-            negatives.append((l, rr))
+            pair_negatives.append((l, rr))
 
             # negative on left
             ll = random.choice(all_left_entities)
@@ -48,9 +51,67 @@ def random_negative_sampling(
             while (ll, r) in known_pairs and trial < 20:
                 ll = random.choice(all_left_entities)
                 trial += 1
-            negatives.append((ll, r))
+            pair_negatives.append((ll, r))
 
-    return negatives
+        if return_grouped:
+            grouped_negatives.append(pair_negatives)
+        else:
+            negatives.extend(pair_negatives)
+
+    return grouped_negatives if return_grouped else negatives
+
+
+def _build_pair(fixed_id: int, candidate_id: int, pick_right: bool) -> Tuple[int, int]:
+    return (fixed_id, candidate_id) if pick_right else (candidate_id, fixed_id)
+
+
+def _select_ranked_candidates(
+    scores: torch.Tensor,
+    candidate_ids: List[int],
+    fixed_id: int,
+    known_pairs: Set[Tuple[int, int]],
+    pick_right: bool,
+    num_samples: int,
+    excluded_id: int = None,
+    validator: Optional[Callable[[int, int], bool]] = None,
+) -> List[Tuple[int, int]]:
+    selected = []
+    used_pairs = set()
+
+    for idx in torch.argsort(scores, descending=True).tolist():
+        candidate_id = candidate_ids[idx]
+        if excluded_id is not None and candidate_id == excluded_id:
+            continue
+        if validator is not None and not validator(candidate_id, idx):
+            continue
+        pair = _build_pair(fixed_id, candidate_id, pick_right)
+        if pair in known_pairs or pair in used_pairs:
+            continue
+        selected.append(pair)
+        used_pairs.add(pair)
+        if len(selected) >= num_samples:
+            return selected
+
+    if len(selected) >= num_samples:
+        return selected
+
+    shuffled_candidates = list(candidate_ids)
+    random.shuffle(shuffled_candidates)
+    for candidate_id in shuffled_candidates:
+        if excluded_id is not None and candidate_id == excluded_id:
+            continue
+        idx = candidate_ids.index(candidate_id)
+        if validator is not None and not validator(candidate_id, idx):
+            continue
+        pair = _build_pair(fixed_id, candidate_id, pick_right)
+        if pair in known_pairs or pair in used_pairs:
+            continue
+        selected.append(pair)
+        used_pairs.add(pair)
+        if len(selected) >= num_samples:
+            break
+
+    return selected
 
 
 @torch.no_grad()
@@ -65,6 +126,7 @@ def hard_negative_sampling(
     known_pairs: Set[Tuple[int, int]],
     topk: int = 5,
     num_hard_neg: int = 1,
+    return_grouped: bool = False,
 ):
     """
     用当前 batch 的联合表示在 batch 内构造难负样本。
@@ -73,6 +135,7 @@ def hard_negative_sampling(
     - 对每个 right，找 batch 内最像但不是对应 left 的若干候选
     """
     negatives = []
+    grouped_negatives = []
 
     sim = F.normalize(left_emb, p=2, dim=-1) @ F.normalize(right_emb, p=2, dim=-1).t()
 
@@ -80,37 +143,41 @@ def hard_negative_sampling(
     batch_right_ids = batch_right_ids.detach().cpu().tolist()
 
     for i, (l, r) in enumerate(batch_pairs):
+        pair_negatives = []
         # hard negative on right
         row = sim[i].clone()
-        pos_j = i
-        row[pos_j] = -1e9
-        cand_js = torch.topk(row, k=min(topk, row.size(0))).indices.tolist()
-
-        picked = 0
-        for j in cand_js:
-            rr = batch_right_ids[j]
-            if (l, rr) not in known_pairs:
-                negatives.append((l, rr))
-                picked += 1
-                if picked >= num_hard_neg:
-                    break
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=row,
+                candidate_ids=batch_right_ids,
+                fixed_id=l,
+                known_pairs=known_pairs,
+                pick_right=True,
+                num_samples=num_hard_neg,
+                excluded_id=r,
+            )
+        )
 
         # hard negative on left
         col = sim[:, i].clone()
-        pos_i = i
-        col[pos_i] = -1e9
-        cand_is = torch.topk(col, k=min(topk, col.size(0))).indices.tolist()
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=col,
+                candidate_ids=batch_left_ids,
+                fixed_id=r,
+                known_pairs=known_pairs,
+                pick_right=False,
+                num_samples=num_hard_neg,
+                excluded_id=l,
+            )
+        )
 
-        picked = 0
-        for ii in cand_is:
-            ll = batch_left_ids[ii]
-            if (ll, r) not in known_pairs:
-                negatives.append((ll, r))
-                picked += 1
-                if picked >= num_hard_neg:
-                    break
+        if return_grouped:
+            grouped_negatives.append(pair_negatives)
+        else:
+            negatives.extend(pair_negatives)
 
-    return negatives
+    return grouped_negatives if return_grouped else negatives
 
 
 @torch.no_grad()
@@ -179,26 +246,6 @@ def global_hard_negative_sampling(
     return negatives
 
 
-def _select_topk_candidates(
-    scores: torch.Tensor,
-    candidate_ids: List[int],
-    fixed_id: int,
-    known_pairs: Set[Tuple[int, int]],
-    pick_right: bool,
-    num_samples: int,
-):
-    selected = []
-    for idx in scores.indices.tolist():
-        candidate_id = candidate_ids[idx]
-        pair = (fixed_id, candidate_id) if pick_right else (candidate_id, fixed_id)
-        if pair in known_pairs:
-            continue
-        selected.append(pair)
-        if len(selected) >= num_samples:
-            break
-    return selected
-
-
 @torch.no_grad()
 def queue_hard_negative_sampling(
     batch_pairs: List[Tuple[int, int]],
@@ -211,8 +258,11 @@ def queue_hard_negative_sampling(
     joint_topk: int,
     num_global_hard_neg: int,
     num_conflict_neg: int,
+    reciprocal_guard_topk: int = 0,
+    return_grouped: bool = False,
 ):
     negatives = []
+    grouped_negatives = []
 
     bank_left_ids = bank["left_ids"].tolist()
     bank_right_ids = bank["right_ids"].tolist()
@@ -235,39 +285,77 @@ def queue_hard_negative_sampling(
 
     batch_left_ids_list = batch_left_ids.detach().cpu().tolist()
     batch_right_ids_list = batch_right_ids.detach().cpu().tolist()
+    right_guard_cache: Dict[int, Set[int]] = {}
+    left_guard_cache: Dict[int, Set[int]] = {}
+
+    def right_candidate_is_safe(left_entity_id: int, right_entity_id: int) -> bool:
+        if reciprocal_guard_topk <= 0:
+            return True
+        cached = right_guard_cache.get(right_entity_id)
+        if cached is None:
+            reverse_scores = bank_right_joint[right_pos[right_entity_id]] @ bank_left_joint.t()
+            guard_k = min(reciprocal_guard_topk, reverse_scores.size(0))
+            cached = {
+                bank_left_ids[idx]
+                for idx in torch.topk(reverse_scores, k=guard_k).indices.tolist()
+            }
+            right_guard_cache[right_entity_id] = cached
+        return left_entity_id not in cached
+
+    def left_candidate_is_safe(right_entity_id: int, left_entity_id: int) -> bool:
+        if reciprocal_guard_topk <= 0:
+            return True
+        cached = left_guard_cache.get(left_entity_id)
+        if cached is None:
+            reverse_scores = bank_left_joint[left_pos[left_entity_id]] @ bank_right_joint.t()
+            guard_k = min(reciprocal_guard_topk, reverse_scores.size(0))
+            cached = {
+                bank_right_ids[idx]
+                for idx in torch.topk(reverse_scores, k=guard_k).indices.tolist()
+            }
+            left_guard_cache[left_entity_id] = cached
+        return right_entity_id not in cached
 
     for i, (l, r) in enumerate(batch_pairs):
+        pair_negatives = []
+
         joint_scores_right = batch_left_joint[i] @ bank_right_joint.t()
-        if r in right_pos:
-            joint_scores_right[right_pos[r]] = -1e9
-        joint_top_right = torch.topk(joint_scores_right, k=min(joint_topk, joint_scores_right.size(0)))
-        negatives.extend(
-            _select_topk_candidates(
-                scores=joint_top_right,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=joint_scores_right,
                 candidate_ids=bank_right_ids,
                 fixed_id=l,
                 known_pairs=known_pairs,
                 pick_right=True,
                 num_samples=num_global_hard_neg,
+                excluded_id=r,
+                validator=lambda candidate_id, _idx, left_entity_id=l: right_candidate_is_safe(
+                    left_entity_id, candidate_id
+                ),
             )
         )
 
         joint_scores_left = batch_right_joint[i] @ bank_left_joint.t()
-        if l in left_pos:
-            joint_scores_left[left_pos[l]] = -1e9
-        joint_top_left = torch.topk(joint_scores_left, k=min(joint_topk, joint_scores_left.size(0)))
-        negatives.extend(
-            _select_topk_candidates(
-                scores=joint_top_left,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=joint_scores_left,
                 candidate_ids=bank_left_ids,
                 fixed_id=r,
                 known_pairs=known_pairs,
                 pick_right=False,
                 num_samples=num_global_hard_neg,
+                excluded_id=l,
+                validator=lambda candidate_id, _idx, right_entity_id=r: left_candidate_is_safe(
+                    right_entity_id, candidate_id
+                ),
             )
         )
 
         if num_conflict_neg <= 0:
+            if return_grouped:
+                grouped_negatives.append(pair_negatives)
+            else:
+                negatives.extend(pair_negatives)
             continue
 
         conflict_right_struct = batch_left_struct[i] @ bank_right_struct.t()
@@ -279,26 +367,26 @@ def queue_hard_negative_sampling(
             conflict_right_b[right_pos[r]] = -1e9
 
         half_conflict = max(1, num_conflict_neg // 2)
-        conflict_top_right_a = torch.topk(conflict_right_a, k=min(joint_topk, conflict_right_a.size(0)))
-        conflict_top_right_b = torch.topk(conflict_right_b, k=min(joint_topk, conflict_right_b.size(0)))
-        negatives.extend(
-            _select_topk_candidates(
-                scores=conflict_top_right_a,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=conflict_right_a,
                 candidate_ids=bank_right_ids,
                 fixed_id=l,
                 known_pairs=known_pairs,
                 pick_right=True,
                 num_samples=half_conflict,
+                excluded_id=r,
             )
         )
-        negatives.extend(
-            _select_topk_candidates(
-                scores=conflict_top_right_b,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=conflict_right_b,
                 candidate_ids=bank_right_ids,
                 fixed_id=l,
                 known_pairs=known_pairs,
                 pick_right=True,
                 num_samples=num_conflict_neg - half_conflict,
+                excluded_id=r,
             )
         )
 
@@ -310,37 +398,35 @@ def queue_hard_negative_sampling(
             conflict_left_a[left_pos[l]] = -1e9
             conflict_left_b[left_pos[l]] = -1e9
 
-        conflict_top_left_a = torch.topk(conflict_left_a, k=min(joint_topk, conflict_left_a.size(0)))
-        conflict_top_left_b = torch.topk(conflict_left_b, k=min(joint_topk, conflict_left_b.size(0)))
-        negatives.extend(
-            _select_topk_candidates(
-                scores=conflict_top_left_a,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=conflict_left_a,
                 candidate_ids=bank_left_ids,
                 fixed_id=r,
                 known_pairs=known_pairs,
                 pick_right=False,
                 num_samples=half_conflict,
+                excluded_id=l,
             )
         )
-        negatives.extend(
-            _select_topk_candidates(
-                scores=conflict_top_left_b,
+        pair_negatives.extend(
+            _select_ranked_candidates(
+                scores=conflict_left_b,
                 candidate_ids=bank_left_ids,
                 fixed_id=r,
                 known_pairs=known_pairs,
                 pick_right=False,
                 num_samples=num_conflict_neg - half_conflict,
+                excluded_id=l,
             )
         )
 
-    deduped = []
-    seen = set()
-    for pair in negatives:
-        if pair in seen:
-            continue
-        seen.add(pair)
-        deduped.append(pair)
-    return deduped
+        if return_grouped:
+            grouped_negatives.append(pair_negatives)
+        else:
+            negatives.extend(pair_negatives)
+
+    return grouped_negatives if return_grouped else negatives
 
 
 def pair_list_to_tensors(pairs: List[Tuple[int, int]], device: torch.device):

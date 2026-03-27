@@ -10,7 +10,7 @@ class CrossModalFusion(nn.Module):
     设计目标:
     1) 先让结构和语义彼此增强，而不是直接重写 joint 表示
     2) 使用跨模态互注意力，让语义直接参与结构邻居选择
-    3) 将增强后的结构/语义向量拼接后，再通过两层 MLP 做最终融合
+    3) 在最终 joint 空间里保留结构/语义互补性，而不是简单平均
     """
 
     def __init__(
@@ -29,7 +29,7 @@ class CrossModalFusion(nn.Module):
         self.struct_key = nn.Linear(dim, dim, bias=False)
         self.struct_value = nn.Linear(dim, dim, bias=False)
         self.sem_key = nn.Linear(dim, dim, bias=False)
-        self.neighbor_sem_gate = nn.Linear(dim * 3, 1)
+        self.neighbor_sem_gate = nn.Linear(dim * 4, 1)
 
         self.struct_to_sem = nn.Sequential(
             nn.Linear(dim * 2, hidden_dim),
@@ -44,15 +44,23 @@ class CrossModalFusion(nn.Module):
             nn.Linear(hidden_dim, dim),
         )
 
-        self.sem_gate = nn.Linear(dim * 3, dim)
-        self.struct_gate = nn.Linear(dim * 3, dim)
-        self.conf_gate = nn.Linear(dim * 3, 1)
+        pair_dim = dim * 4
+        self.sem_gate = nn.Linear(pair_dim, dim)
+        self.struct_gate = nn.Linear(pair_dim, dim)
+        self.conf_gate = nn.Linear(pair_dim, 1)
+        self.joint_gate = nn.Linear(pair_dim, dim)
+        self.agreement_gate = nn.Linear(pair_dim, dim)
         self.joint_mlp = nn.Sequential(
-            nn.Linear(dim * 2, hidden_dim),
+            nn.Linear(pair_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
         )
+        self.joint_norm = nn.LayerNorm(dim)
+
+    @staticmethod
+    def _pair_features(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x, y, x * y, torch.abs(x - y)], dim=-1)
 
     def forward(
         self,
@@ -74,7 +82,7 @@ class CrossModalFusion(nn.Module):
         # with the semantic branch and suppress semantically inconsistent ones.
         s_expand = s.unsqueeze(1).expand_as(t_nei)
         neighbor_sem_gate = torch.sigmoid(
-            self.neighbor_sem_gate(torch.cat([t_nei, s_expand, t_nei - s_expand], dim=-1))
+            self.neighbor_sem_gate(self._pair_features(t_nei, s_expand))
         ).squeeze(-1)
 
         gated_scores = attn_scores + torch.log(neighbor_sem_gate.clamp(min=1e-6))
@@ -102,11 +110,11 @@ class CrossModalFusion(nn.Module):
         sem_delta = torch.tanh(self.struct_to_sem(sem_input))
         struct_delta = torch.tanh(self.sem_to_struct(struct_input))
 
-        sem_gate = torch.sigmoid(self.sem_gate(torch.cat([s, struct_context, s - struct_context], dim=-1)))
-        struct_gate = torch.sigmoid(self.struct_gate(torch.cat([t_self, s, t_self - s], dim=-1)))
+        sem_gate = torch.sigmoid(self.sem_gate(self._pair_features(s, struct_context)))
+        struct_gate = torch.sigmoid(self.struct_gate(self._pair_features(t_self, s)))
 
         # Confidence gate: trust enhancement more when structure/semantic agree.
-        conf = torch.sigmoid(self.conf_gate(torch.cat([s, struct_context, s - struct_context], dim=-1)))
+        conf = torch.sigmoid(self.conf_gate(self._pair_features(s, struct_context)))
         # Margin-based confidence: if semantic is closer to self-structure than neighbors, boost confidence.
         nei_sim = (t_nei * s_expand).sum(dim=-1).masked_fill(nei_mask == 0, -1e9)
         hard_nei_sim = nei_sim.max(dim=1).values
@@ -117,13 +125,21 @@ class CrossModalFusion(nn.Module):
         s_enhanced = F.normalize(s + ratio * sem_gate * sem_delta, p=2, dim=-1)
         t_enhanced = F.normalize(t_self + ratio * struct_gate * struct_delta, p=2, dim=-1)
 
-        # Guidance-aligned final fusion:
-        # concatenate the enhanced semantic/structural vectors, then use a
-        # two-layer MLP to produce the joint alignment embedding.
-        joint_input = torch.cat([s_enhanced, t_enhanced], dim=-1)
-        joint_delta = torch.tanh(self.joint_mlp(joint_input))
-        base_joint = 0.5 * (s_enhanced + t_enhanced)
-        z_joint = F.normalize(base_joint + conf * joint_delta, p=2, dim=-1)
+        # Final fusion:
+        # learn a per-dimension structure-vs-semantic mixture, then refine it
+        # with an agreement-aware residual instead of a plain average.
+        joint_features = self._pair_features(s_enhanced, t_enhanced)
+        joint_mix_gate = torch.sigmoid(self.joint_gate(joint_features))
+        agreement_gate = torch.sigmoid(self.agreement_gate(joint_features))
+        mixed_joint = joint_mix_gate * t_enhanced + (1.0 - joint_mix_gate) * s_enhanced
+        avg_joint = 0.5 * (s_enhanced + t_enhanced)
+        base_joint = 0.5 * (mixed_joint + avg_joint)
+        joint_delta = torch.tanh(self.joint_mlp(joint_features))
+        z_joint = F.normalize(
+            self.joint_norm(base_joint + conf * agreement_gate * joint_delta),
+            p=2,
+            dim=-1,
+        )
 
         if return_components:
             semantic_attention = attn_weights
@@ -135,6 +151,8 @@ class CrossModalFusion(nn.Module):
                 "semantic_attention": semantic_attention,
                 "structural_gate": structural_gate,
                 "confidence_gate": conf,
+                "joint_mix_gate": joint_mix_gate,
+                "agreement_gate": agreement_gate,
             }
 
         return z_joint
