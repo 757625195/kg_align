@@ -23,8 +23,10 @@ class Config:
     # =========================
     root: str = "data/dbp15k"
     pair: str = "zh_en"
-    # Follow the commonly used DBP15K 0_3 supervision protocol for formal experiments.
-    data_source: str = "fixed_eval"
+    # Default to the strongest verified formal setting: DBP15K raw 0_3.
+    # Use KG_ALIGN_DATA_SOURCE=fixed_eval when you explicitly want the legacy
+    # fixed validation split protocol.
+    data_source: str = "raw_split"
     raw_split: str = "0_3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     val_ratio: float = 0.1
@@ -61,14 +63,21 @@ class Config:
     fusion_dim: int = 128
     ce_residual_ratio: float = 0.1
     gnn_layers: int = 2
+    use_relation_gnn: bool = True
+    relation_layer_fusion: bool = True
     gnn_share_parameters: bool = False
     gnn_use_depthwise_separable: bool = False
+    alignment_csls_k: int = 10
+    alignment_csls_blend: float = 1.0
     text_heads: int = 4
     text_layers: int = 2
     dropout: float = 0.1
 
     # neighbor-aware fusion
     num_neighbors: int = 8
+    use_relation_aware_neighbor_sampling: bool = True
+    neighbor_relation_score_alpha: float = 1.0
+    neighbor_degree_score_alpha: float = 0.25
 
     # =========================
     # Ablation
@@ -187,6 +196,78 @@ def apply_optional_env(cfg: Config, env_name: str, attr: str, cast) -> None:
     setattr(cfg, attr, cast(env_value))
 
 
+def apply_raw_split_best_defaults(cfg: Config) -> None:
+    """
+    Strongest verified raw-split baseline.
+
+    This preset intentionally keeps:
+    - joint-only final scoring
+    - active learning off
+    - topology matching off
+    while baking in the confirmed improvements from the text encoder, fusion,
+    relation-aware structural encoder, and per-pair hardest negatives.
+    """
+    cfg.warmup_epochs = 3
+    cfg.joint_epochs = 36
+    cfg.lr = 5e-4
+    cfg.use_final_weight_averaging = True
+    cfg.weight_average_last_k = 10
+    cfg.use_ema_eval = False
+    cfg.ema_decay = 0.90
+    cfg.ema_start_epoch = 20
+
+    cfg.lambda_branch_align = 0.15
+    cfg.branch_align_start = 0.25
+    cfg.branch_align_end = 0.65
+    cfg.cross_modal_start = 0.40
+    cfg.cross_modal_end = 0.80
+    cfg.joint_branch_start = 0.55
+    cfg.joint_branch_end = 0.90
+    cfg.topology_start = 0.70
+    cfg.topology_end = 0.98
+    cfg.lambda_cross_modal = 0.005
+    cfg.lambda_joint_branch = 0.01
+    cfg.lambda_struct = 0.05
+    cfg.lambda_sem = 0.05
+    cfg.lambda_topology = 0.00
+
+    cfg.do_active_learning = False
+    cfg.ce_residual_ratio = 0.10
+
+    cfg.num_hard_neg = 2
+    cfg.hard_topk = 10
+    cfg.num_global_hard_neg = 2
+    cfg.global_hard_topk = 20
+    cfg.global_hard_topk_max = 50
+    cfg.global_hard_start_epoch = 1
+    cfg.global_hard_reciprocal_guard_topk = 0
+    cfg.memory_bank_epochs = 2
+    cfg.hard_negative_weight = 2.0
+    cfg.lambda_ranking = 0.05
+    cfg.use_pairwise_hard_neg = False
+    cfg.per_pair_hard_neg = True
+    cfg.stable_neg_topk = 1
+    cfg.stable_ranking_topk = 1
+
+    cfg.gnn_layers = 3
+    cfg.relation_layer_fusion = True
+    cfg.use_relation_aware_neighbor_sampling = True
+    cfg.neighbor_relation_score_alpha = 1.0
+    cfg.neighbor_degree_score_alpha = 0.25
+
+    # If AL is turned back on manually, use a conservative held-out-train pool.
+    cfg.al_pool_ratio = 0.05
+    cfg.al_rounds = 2
+    cfg.al_budget = 80
+    cfg.al_every_epochs = 12
+    cfg.al_min_confidence = 0.50
+    cfg.al_min_margin = 0.05
+    cfg.al_negative_weight = 0.60
+    cfg.al_alpha_uncertainty = 0.25
+    cfg.al_alpha_repr = 0.75
+    cfg.al_max_filter_stage = "reciprocal_relaxed_margin"
+
+
 def apply_runtime_overrides(cfg: Config) -> None:
     seed_env = os.environ.get("KG_ALIGN_SEED")
     if seed_env is not None:
@@ -226,87 +307,19 @@ def apply_runtime_overrides(cfg: Config) -> None:
             raise ValueError(f"KG_ALIGN_SEED must be an int, got: {seed_env}")
 
     per_pair_env = os.environ.get("KG_ALIGN_PER_PAIR_HARD_NEG")
-    if per_pair_env is not None:
-        cfg.per_pair_hard_neg = parse_bool_env(per_pair_env)
+    relation_gnn_env = os.environ.get("KG_ALIGN_RELATION_GNN")
+    relation_layer_fusion_env = os.environ.get("KG_ALIGN_RELATION_LAYER_FUSION")
+    neighbor_select_env = os.environ.get("KG_ALIGN_RELATION_AWARE_NEIGHBOR_SAMPLING")
+    if relation_gnn_env is not None:
+        cfg.use_relation_gnn = parse_bool_env(relation_gnn_env)
+    apply_optional_env(cfg, "KG_ALIGN_ALIGNMENT_CSLS_K", "alignment_csls_k", int)
+    apply_optional_env(cfg, "KG_ALIGN_ALIGNMENT_CSLS_BLEND", "alignment_csls_blend", float)
+    apply_optional_env(cfg, "KG_ALIGN_GNN_LAYERS", "gnn_layers", int)
+    apply_optional_env(cfg, "KG_ALIGN_NEIGHBOR_REL_ALPHA", "neighbor_relation_score_alpha", float)
+    apply_optional_env(cfg, "KG_ALIGN_NEIGHBOR_DEG_ALPHA", "neighbor_degree_score_alpha", float)
 
     if cfg.data_source == "raw_split":
-        # Treat the official DBP15K 0_3 protocol as a separate experimental
-        # regime. It has much less supervision than the fixed split setting, so
-        # we train longer, lower the learning rate, and make the collaborative
-        # objectives ramp up later.
-        cfg.warmup_epochs = 3
-        cfg.joint_epochs = 36
-        cfg.lr = 5e-4
-        cfg.use_final_weight_averaging = True
-        cfg.weight_average_last_k = 10
-        cfg.use_ema_eval = False
-        cfg.ema_decay = 0.90
-        cfg.ema_start_epoch = 20
-        cfg.lambda_branch_align = 0.15
-        cfg.branch_align_start = 0.25
-        cfg.branch_align_end = 0.65
-        cfg.cross_modal_start = 0.40
-        cfg.cross_modal_end = 0.80
-        cfg.joint_branch_start = 0.55
-        cfg.joint_branch_end = 0.90
-        cfg.topology_start = 0.70
-        cfg.topology_end = 0.98
-        cfg.lambda_cross_modal = 0.005
-        cfg.lambda_joint_branch = 0.01
-        # Raw-split experiments are sensitive to extra structural regularization.
-        # Keep topology matching available for manual sweeps, but do not enable
-        # it by default in the low-supervision setting.
-        cfg.lambda_topology = 0.00
-        # Baseline-first protocol: keep active learning off by default while we
-        # strengthen the main supervised alignment path. It can still be
-        # re-enabled explicitly via KG_ALIGN_AL=1 for follow-up experiments.
-        cfg.do_active_learning = False
-        cfg.ce_residual_ratio = 0.10
-        # Keep the raw-split baseline focused on the strongest confirmed gain
-        # so far (the upgraded text encoder). Hard-negative/ranking variants
-        # remain available through env overrides, but they are not enabled by
-        # default because they did not improve the single-seed baseline.
-        cfg.num_hard_neg = 2
-        cfg.hard_topk = 10
-        cfg.num_global_hard_neg = 2
-        cfg.global_hard_topk = 20
-        cfg.global_hard_topk_max = 50
-        cfg.global_hard_start_epoch = 1
-        cfg.global_hard_reciprocal_guard_topk = 0
-        cfg.memory_bank_epochs = 2
-        cfg.hard_negative_weight = 2.0
-        cfg.lambda_ranking = 0.05
-        cfg.use_pairwise_hard_neg = False
-        # Each positive pair focuses on its own hardest sampled negatives.
-        cfg.per_pair_hard_neg = True
-        cfg.stable_neg_topk = 1
-        cfg.stable_ranking_topk = 1
-
-        # Use weaker branch-to-joint consistency so the structural/semantic
-        # branches keep more complementarity instead of collapsing too
-        # aggressively toward the joint space.
-        cfg.lambda_struct = 0.05
-        cfg.lambda_sem = 0.05
-
-        # In raw-split the model is already quite stable, so repeated runs with
-        # the same seed mostly collapse to the same optimum. We therefore make
-        # active learning more conservative by delaying it, shrinking the
-        # budget, and disallowing low-quality non-reciprocal fallback stages.
-        #
-        # Important protocol choice: for raw-split experiments we no longer use
-        # the official test split as an oracle annotation pool. Instead, we hold
-        # out a small slice of the training supervision as the AL pool so the
-        # active-learning loop stays within the training regime.
-        cfg.al_pool_ratio = 0.05
-        cfg.al_rounds = 2
-        cfg.al_budget = 80
-        cfg.al_every_epochs = 12
-        cfg.al_min_confidence = 0.50
-        cfg.al_min_margin = 0.05
-        cfg.al_negative_weight = 0.60
-        cfg.al_alpha_uncertainty = 0.25
-        cfg.al_alpha_repr = 0.75
-        cfg.al_max_filter_stage = "reciprocal_relaxed_margin"
+        apply_raw_split_best_defaults(cfg)
 
     apply_optional_env(cfg, "KG_ALIGN_BATCH_SIZE", "batch_size", int)
     apply_optional_env(cfg, "KG_ALIGN_EVAL_BATCH_SIZE", "eval_batch_size", int)
@@ -380,6 +393,17 @@ def apply_runtime_overrides(cfg: Config) -> None:
     require_bidir_env = os.environ.get("KG_ALIGN_AL_REQUIRE_BIDIRECTIONAL")
     if require_bidir_env is not None:
         cfg.al_require_bidirectional = parse_bool_env(require_bidir_env)
+
+    # Re-apply preset-sensitive boolean overrides after the raw-split best
+    # baseline so manual sweeps can still turn individual components off.
+    if per_pair_env is not None:
+        cfg.per_pair_hard_neg = parse_bool_env(per_pair_env)
+    if relation_gnn_env is not None:
+        cfg.use_relation_gnn = parse_bool_env(relation_gnn_env)
+    if relation_layer_fusion_env is not None:
+        cfg.relation_layer_fusion = parse_bool_env(relation_layer_fusion_env)
+    if neighbor_select_env is not None:
+        cfg.use_relation_aware_neighbor_sampling = parse_bool_env(neighbor_select_env)
 
     # Re-apply the top-level AL switch after raw-split profile defaults so
     # baseline-first defaults do not block explicit follow-up AL experiments.
@@ -608,7 +632,7 @@ def build_candidate_right_ids(
     return torch.arange(n1, n1 + n2, dtype=torch.long)
 
 
-def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
+def build_model(cfg: Config, total_nodes: int, num_relations: int) -> JointEAModel:
     return JointEAModel(
         num_nodes=total_nodes,
         text_input_dim=cfg.text_input_dim,
@@ -617,6 +641,11 @@ def build_model(cfg: Config, total_nodes: int) -> JointEAModel:
         text_hidden_dim=cfg.text_hidden_dim,
         fusion_dim=cfg.fusion_dim,
         gnn_layers=cfg.gnn_layers,
+        use_relation_gnn=cfg.use_relation_gnn,
+        num_relations=num_relations,
+        relation_layer_fusion=cfg.relation_layer_fusion,
+        alignment_csls_k=cfg.alignment_csls_k,
+        alignment_csls_blend=cfg.alignment_csls_blend,
         gnn_share_parameters=cfg.gnn_share_parameters,
         gnn_use_depthwise_separable=cfg.gnn_use_depthwise_separable,
         text_heads=cfg.text_heads,
@@ -656,6 +685,7 @@ def forward_entities(
     model: JointEAModel,
     node_ids: torch.Tensor,
     edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
     seq_features: torch.Tensor,
     adj_list: Dict[int, List[int]],
     cfg: Config,
@@ -682,6 +712,7 @@ def forward_entities(
         seq_features=seq_x,
         neighbor_ids=neighbor_ids,
         neighbor_mask=neighbor_mask,
+        edge_type=edge_type,
     )
     return out
 
@@ -690,6 +721,7 @@ def forward_entities(
 def build_global_negative_cache(
     model: JointEAModel,
     edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
     seq_features: torch.Tensor,
     adj_list: Dict[int, List[int]],
     train_pairs: List[Tuple[int, int]],
@@ -703,6 +735,7 @@ def build_global_negative_cache(
         model=model,
         node_ids=left_ids,
         edge_index=edge_index,
+        edge_type=edge_type,
         seq_features=seq_features,
         adj_list=adj_list,
         num_neighbors=cfg.num_neighbors,
@@ -713,6 +746,7 @@ def build_global_negative_cache(
         model=model,
         node_ids=right_ids,
         edge_index=edge_index,
+        edge_type=edge_type,
         seq_features=seq_features,
         adj_list=adj_list,
         num_neighbors=cfg.num_neighbors,
@@ -749,7 +783,7 @@ def get_dynamic_topk(epoch: int, total_epochs: int, base_topk: int, max_topk: in
 def merge_negative_groups(*group_sources: List[List[Tuple[int, int]]]) -> List[List[Tuple[int, int]]]:
     merged = None
     for source in group_sources:
-        if source is None:
+        if source is None or len(source) == 0:
             continue
         if merged is None:
             merged = [list(group) for group in source]
@@ -788,6 +822,7 @@ def train_one_epoch(
     model: JointEAModel,
     loader: DataLoader,
     edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
     seq_features: torch.Tensor,
     adj_list: Dict[int, List[int]],
     optimizer: torch.optim.Optimizer,
@@ -833,6 +868,7 @@ def train_one_epoch(
             model=model,
             node_ids=left_id,
             edge_index=edge_index,
+            edge_type=edge_type,
             seq_features=seq_features,
             adj_list=adj_list,
             cfg=cfg,
@@ -843,6 +879,7 @@ def train_one_epoch(
             model=model,
             node_ids=right_id,
             edge_index=edge_index,
+            edge_type=edge_type,
             seq_features=seq_features,
             adj_list=adj_list,
             cfg=cfg,
@@ -927,6 +964,7 @@ def train_one_epoch(
                     model=model,
                     node_ids=neg_left_ids,
                     edge_index=edge_index,
+                    edge_type=edge_type,
                     seq_features=seq_features,
                     adj_list=adj_list,
                     cfg=cfg,
@@ -937,6 +975,7 @@ def train_one_epoch(
                     model=model,
                     node_ids=neg_right_ids,
                     edge_index=edge_index,
+                    edge_type=edge_type,
                     seq_features=seq_features,
                     adj_list=adj_list,
                     cfg=cfg,
@@ -964,6 +1003,7 @@ def train_one_epoch(
                     model=model,
                     node_ids=al_neg_left_ids,
                     edge_index=edge_index,
+                    edge_type=edge_type,
                     seq_features=seq_features,
                     adj_list=adj_list,
                     cfg=cfg,
@@ -974,6 +1014,7 @@ def train_one_epoch(
                     model=model,
                     node_ids=al_neg_right_ids,
                     edge_index=edge_index,
+                    edge_type=edge_type,
                     seq_features=seq_features,
                     adj_list=adj_list,
                     cfg=cfg,
@@ -1076,6 +1117,10 @@ def main():
     n1 = data["n1"]
     n2 = data["n2"]
     edge_index = data["edge_index"].to(device)
+    edge_type = data.get("edge_type")
+    if edge_type is not None:
+        edge_type = edge_type.to(device)
+    num_relations = int(data.get("num_relations", 0))
     seq_features = data["seq_features"]   # 通常放 CPU
     raw_train_pairs = list(data["train_pairs"])
     raw_test_pairs = list(data["test_pairs"])
@@ -1097,7 +1142,14 @@ def main():
     test_candidate_right_ids = build_candidate_right_ids(cfg, n1, n2, test_pairs)
 
     # 用 CPU 上的 edge_index 建邻接表，避免 GPU tensor 转 list 问题
-    adj_list = build_adj_list(data["edge_index"].cpu(), total_nodes)
+    adj_list = build_adj_list(
+        data["edge_index"].cpu(),
+        total_nodes,
+        edge_type=data.get("edge_type").cpu() if data.get("edge_type") is not None else None,
+        use_relation_aware=cfg.use_relation_aware_neighbor_sampling,
+        relation_score_alpha=cfg.neighbor_relation_score_alpha,
+        neighbor_degree_alpha=cfg.neighbor_degree_score_alpha,
+    )
 
     print(f"Pair: {cfg.pair}")
     print(f"Data source: {cfg.data_source}")
@@ -1107,6 +1159,8 @@ def main():
     print(f"Seed: {cfg.seed}")
     print(f"Total nodes: {total_nodes}")
     print(f"Edges total: {edge_index.size(1)}")
+    if num_relations > 0:
+        print(f"Relations total: {num_relations}")
     print(f"Train pairs: {len(train_pairs)}")
     print(f"Val pairs: {len(val_pairs)}")
     if al_pool_left_ids and al_pool_right_ids:
@@ -1152,8 +1206,22 @@ def main():
     )
     print(
         "Structural encoder switches: "
+        f"relation_gnn={cfg.use_relation_gnn and num_relations > 0}, "
+        f"layer_fusion={cfg.relation_layer_fusion and cfg.use_relation_gnn and num_relations > 0}, "
         f"shared_gnn={cfg.gnn_share_parameters}, "
         f"depthwise_separable={cfg.gnn_use_depthwise_separable}"
+    )
+    print(
+        "Neighbor selector: "
+        f"relation_aware={cfg.use_relation_aware_neighbor_sampling and edge_type is not None}, "
+        f"rel_alpha={cfg.neighbor_relation_score_alpha:.2f}, "
+        f"deg_alpha={cfg.neighbor_degree_score_alpha:.2f}"
+    )
+    print(
+        "Alignment scorer: "
+        f"temperature={cfg.temperature:.2f}, "
+        f"csls_k={cfg.alignment_csls_k}, "
+        f"csls_blend={cfg.alignment_csls_blend:.2f}"
     )
     print(f"CE residual ratio: {cfg.ce_residual_ratio:.2f}")
     print(
@@ -1188,7 +1256,7 @@ def main():
         )
     print(f"Early stopping enabled: {should_use_early_stopping(cfg)}")
 
-    model = build_model(cfg, total_nodes=total_nodes).to(device)
+    model = build_model(cfg, total_nodes=total_nodes, num_relations=num_relations).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -1218,6 +1286,7 @@ def main():
             model=model,
             loader=warmup_loader,
             edge_index=edge_index,
+            edge_type=edge_type,
             seq_features=seq_features,
             adj_list=adj_list,
             optimizer=optimizer,
@@ -1231,6 +1300,7 @@ def main():
             metrics = evaluate_alignment(
                 model=model,
                 edge_index=edge_index,
+                edge_type=edge_type,
                 seq_features=seq_features,
                 adj_list=adj_list,
                 num_neighbors=cfg.num_neighbors,
@@ -1286,6 +1356,7 @@ def main():
             current_bank = build_global_negative_cache(
                 model=model,
                 edge_index=edge_index,
+                edge_type=edge_type,
                 seq_features=seq_features,
                 adj_list=adj_list,
                 train_pairs=train_pairs,
@@ -1300,6 +1371,7 @@ def main():
             model=model,
             loader=train_loader,
             edge_index=edge_index,
+            edge_type=edge_type,
             seq_features=seq_features,
             adj_list=adj_list,
             optimizer=optimizer,
@@ -1318,6 +1390,7 @@ def main():
             metrics = evaluate_alignment(
                 model=model,
                 edge_index=edge_index,
+                edge_type=edge_type,
                 seq_features=seq_features,
                 adj_list=adj_list,
                 num_neighbors=cfg.num_neighbors,
@@ -1398,6 +1471,7 @@ def main():
                 model=model,
                 cfg=cfg,
                 edge_index=edge_index,
+                edge_type=edge_type,
                 seq_features=seq_features,
                 adj_list=adj_list,
                 train_pairs=train_pairs,
@@ -1455,6 +1529,7 @@ def main():
             final_test_metrics = evaluate_alignment(
                 model=model,
                 edge_index=edge_index,
+                edge_type=edge_type,
                 seq_features=seq_features,
                 adj_list=adj_list,
                 num_neighbors=cfg.num_neighbors,
@@ -1496,6 +1571,7 @@ def main():
         final_test_metrics = evaluate_alignment(
             model=model,
             edge_index=edge_index,
+            edge_type=edge_type,
             seq_features=seq_features,
             adj_list=adj_list,
             num_neighbors=cfg.num_neighbors,

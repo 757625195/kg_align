@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch_geometric.datasets import DBP15K
@@ -60,6 +60,8 @@ def load_dbp15k_from_pyg(root: str = "data/dbp15k", pair: str = "zh_en") -> Dict
         "n1": n1,
         "n2": n2,
         "edge_index": edge_index,
+        "edge_type": None,
+        "num_relations": 0,
         "seq_features": seq_features,
         "seq_feature_map": seq_feature_map,
         "train_pairs": train_pairs,
@@ -78,6 +80,188 @@ def _read_ent_id_mapping(path: str) -> Dict[int, int]:
             raw_id_str, _ = line.split("\t", 1)
             raw_to_local[int(raw_id_str)] = local_idx
     return raw_to_local
+
+
+def _read_relation_vocab(path: str) -> Dict[int, str]:
+    rel_vocab = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rel_id_str, rel_name = line.split("\t", 1)
+            rel_vocab[int(rel_id_str)] = rel_name
+    return rel_vocab
+
+
+def _canonicalize_relation_name(name: str) -> str:
+    if "dbpedia.org" in name:
+        return name.split("dbpedia.org", 1)[1]
+    return name
+
+
+def _read_alignment_pairs(path: str) -> List[Tuple[int, int]]:
+    pairs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            left_id_str, right_id_str = line.split("\t")
+            pairs.append((int(left_id_str), int(right_id_str)))
+    return pairs
+
+
+def _find(parent: Dict[Tuple[str, int], Tuple[str, int]], node: Tuple[str, int]) -> Tuple[str, int]:
+    root = parent[node]
+    if root != node:
+        parent[node] = _find(parent, root)
+    return parent[node]
+
+
+def _union(
+    parent: Dict[Tuple[str, int], Tuple[str, int]],
+    a: Tuple[str, int],
+    b: Tuple[str, int],
+) -> None:
+    root_a = _find(parent, a)
+    root_b = _find(parent, b)
+    if root_a != root_b:
+        parent[root_b] = root_a
+
+
+def _build_relation_id_maps(
+    left_rel_path: str,
+    right_rel_path: str,
+    sup_rel_path: Optional[str] = None,
+) -> Tuple[Dict[int, int], Dict[int, int], int]:
+    left_vocab = _read_relation_vocab(left_rel_path)
+    right_vocab = _read_relation_vocab(right_rel_path)
+
+    parent = {
+        ("left", rel_id): ("left", rel_id)
+        for rel_id in left_vocab
+    }
+    parent.update({
+        ("right", rel_id): ("right", rel_id)
+        for rel_id in right_vocab
+    })
+
+    canonical_representatives: Dict[str, Tuple[str, int]] = {}
+    for side, vocab in (("left", left_vocab), ("right", right_vocab)):
+        for rel_id, rel_name in vocab.items():
+            node = (side, rel_id)
+            canonical_name = _canonicalize_relation_name(rel_name)
+            if canonical_name in canonical_representatives:
+                _union(parent, node, canonical_representatives[canonical_name])
+            else:
+                canonical_representatives[canonical_name] = node
+
+    if sup_rel_path is not None and os.path.exists(sup_rel_path):
+        for left_rel_id, right_rel_id in _read_alignment_pairs(sup_rel_path):
+            left_node = ("left", left_rel_id)
+            right_node = ("right", right_rel_id)
+            if left_node in parent and right_node in parent:
+                _union(parent, left_node, right_node)
+
+    root_to_global = {}
+    left_rel_to_global = {}
+    right_rel_to_global = {}
+
+    for rel_id in left_vocab:
+        root = _find(parent, ("left", rel_id))
+        if root not in root_to_global:
+            root_to_global[root] = len(root_to_global)
+        left_rel_to_global[rel_id] = root_to_global[root]
+
+    for rel_id in right_vocab:
+        root = _find(parent, ("right", rel_id))
+        if root not in root_to_global:
+            root_to_global[root] = len(root_to_global)
+        right_rel_to_global[rel_id] = root_to_global[root]
+
+    return left_rel_to_global, right_rel_to_global, len(root_to_global)
+
+
+def _read_relation_aware_triples(
+    path: str,
+    ent_raw_to_local: Dict[int, int],
+    rel_raw_to_global: Dict[int, int],
+    node_offset: int,
+) -> Tuple[List[Tuple[int, int]], List[int]]:
+    edges = []
+    edge_types = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            head_raw_str, rel_raw_str, tail_raw_str = line.split("\t")
+            head_raw = int(head_raw_str)
+            rel_raw = int(rel_raw_str)
+            tail_raw = int(tail_raw_str)
+            if head_raw not in ent_raw_to_local or tail_raw not in ent_raw_to_local:
+                continue
+            if rel_raw not in rel_raw_to_global:
+                continue
+            edges.append((
+                ent_raw_to_local[head_raw] + node_offset,
+                ent_raw_to_local[tail_raw] + node_offset,
+            ))
+            edge_types.append(rel_raw_to_global[rel_raw])
+    return edges, edge_types
+
+
+def _load_relation_aware_graph(
+    left_ent_path: str,
+    right_ent_path: str,
+    triples1_path: str,
+    triples2_path: str,
+    left_rel_path: Optional[str],
+    right_rel_path: Optional[str],
+    sup_rel_path: Optional[str],
+    right_global_offset: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    required_paths = [
+        left_ent_path,
+        right_ent_path,
+        triples1_path,
+        triples2_path,
+        left_rel_path,
+        right_rel_path,
+    ]
+    if any(path is None or not os.path.exists(path) for path in required_paths):
+        return None, None, 0
+
+    left_ent_map = _read_ent_id_mapping(left_ent_path)
+    right_ent_map = _read_ent_id_mapping(right_ent_path)
+    left_rel_map, right_rel_map, num_relations = _build_relation_id_maps(
+        left_rel_path=left_rel_path,
+        right_rel_path=right_rel_path,
+        sup_rel_path=sup_rel_path,
+    )
+
+    edges1, edge_types1 = _read_relation_aware_triples(
+        path=triples1_path,
+        ent_raw_to_local=left_ent_map,
+        rel_raw_to_global=left_rel_map,
+        node_offset=0,
+    )
+    edges2, edge_types2 = _read_relation_aware_triples(
+        path=triples2_path,
+        ent_raw_to_local=right_ent_map,
+        rel_raw_to_global=right_rel_map,
+        node_offset=right_global_offset,
+    )
+
+    all_edges = edges1 + edges2
+    all_edge_types = edge_types1 + edge_types2
+    if not all_edges:
+        return None, None, 0
+
+    edge_index = torch.tensor(all_edges, dtype=torch.long).t().contiguous()
+    edge_type = torch.tensor(all_edge_types, dtype=torch.long)
+    return edge_index, edge_type, num_relations
 
 
 def _read_pair_ids(
@@ -153,6 +337,20 @@ def load_dbp15k_raw_split(
     base["train_pairs"] = train_pairs
     base["test_pairs"] = test_pairs
     base["raw_split"] = split
+    relation_edge_index, relation_edge_type, num_relations = _load_relation_aware_graph(
+        left_ent_path=os.path.join(split_dir, "ent_ids_1"),
+        right_ent_path=os.path.join(split_dir, "ent_ids_2"),
+        triples1_path=os.path.join(split_dir, "triples_1"),
+        triples2_path=os.path.join(split_dir, "triples_2"),
+        left_rel_path=os.path.join(split_dir, "rel_ids_1"),
+        right_rel_path=os.path.join(split_dir, "rel_ids_2"),
+        sup_rel_path=os.path.join(split_dir, "sup_rel_ids"),
+        right_global_offset=base["n1"],
+    )
+    if relation_edge_index is not None and relation_edge_type is not None:
+        base["edge_index"] = relation_edge_index
+        base["edge_type"] = relation_edge_type
+        base["num_relations"] = num_relations
     return base
 
 

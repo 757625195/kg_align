@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .gnn_encoder import LightweightGNNEncoder
+from .gnn_encoder import LightweightGNNEncoder, RelationAwareGNNEncoder
 from .text_encoder import MultiScaleTransformerEncoder, SimpleTextEncoder
 from .fusion import CrossModalFusion
 from .alignment_head import AlignmentHead
@@ -28,17 +28,35 @@ class JointEAModel(nn.Module):
         gnn_share_parameters: bool = False,
         gnn_use_depthwise_separable: bool = False,
         use_explicit_topology_matching: bool = True,
+        use_relation_gnn: bool = True,
+        num_relations: int = 0,
+        relation_layer_fusion: bool = True,
+        alignment_csls_k: int = 0,
+        alignment_csls_blend: float = 1.0,
     ):
         super().__init__()
         self.use_mst = use_mst
         self.use_light_gnn = use_light_gnn
         self.use_cross_modal_enhancement = use_cross_modal_enhancement
         self.use_explicit_topology_matching = use_explicit_topology_matching
+        self.use_relation_gnn = use_relation_gnn and num_relations > 0
+        self.num_relations = num_relations
 
         self.node_emb = nn.Embedding(num_nodes, node_input_dim)
         self.node_proj = nn.Linear(node_input_dim, fusion_dim)
 
-        if use_light_gnn:
+        if use_light_gnn and self.use_relation_gnn:
+            self.gnn_encoder = RelationAwareGNNEncoder(
+                in_dim=node_input_dim,
+                hidden_dim=gnn_hidden_dim,
+                out_dim=fusion_dim,
+                num_relations=num_relations,
+                num_layers=gnn_layers,
+                dropout=dropout,
+                share_parameters=gnn_share_parameters,
+                use_layer_fusion=relation_layer_fusion,
+            )
+        elif use_light_gnn:
             self.gnn_encoder = LightweightGNNEncoder(
                 in_dim=node_input_dim,
                 hidden_dim=gnn_hidden_dim,
@@ -74,14 +92,26 @@ class JointEAModel(nn.Module):
             residual_ratio=ce_residual_ratio,
         )
 
-        self.align_head = AlignmentHead()
+        self.align_head = AlignmentHead(
+            csls_k=alignment_csls_k,
+            csls_blend=alignment_csls_blend,
+        )
 
-    def encode_structure_all(self, edge_index: torch.Tensor) -> torch.Tensor:
+    def encode_structure_all(
+        self,
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor = None,
+    ) -> torch.Tensor:
         # 结构分支先对整图编码，再按当前 batch 取实体及其邻居表示。
         x = self.node_emb.weight
         if self.gnn_encoder is None:
             return F.normalize(self.node_proj(x), p=2, dim=-1)
-        z_struct_all = self.gnn_encoder(x, edge_index)
+        if self.use_relation_gnn:
+            if edge_type is None:
+                raise ValueError("Relation-aware GNN requires edge_type")
+            z_struct_all = self.gnn_encoder(x, edge_index, edge_type)
+        else:
+            z_struct_all = self.gnn_encoder(x, edge_index)
         return z_struct_all
 
     def encode_semantics(self, seq_features: torch.Tensor) -> torch.Tensor:
@@ -97,10 +127,14 @@ class JointEAModel(nn.Module):
         seq_features: torch.Tensor,   # [B, L, Din]
         neighbor_ids: torch.Tensor,   # [B, K]
         neighbor_mask: torch.Tensor,  # [B, K]
+        edge_type: torch.Tensor = None,  # [E]
     ):
         # 全图结构编码 + batch 级局部邻居提取，是当前轻量化设计的核心：
         # 用一次稀疏消息传递覆盖多跳上下文，再用固定邻居预算控制后续交互成本。
-        z_struct_all = self.encode_structure_all(edge_index)    # [N, D]
+        z_struct_all = self.encode_structure_all(
+            edge_index=edge_index,
+            edge_type=edge_type,
+        )    # [N, D]
 
         z_struct = z_struct_all[node_ids]                       # [B, D]
         z_neighbor = z_struct_all[neighbor_ids]                # [B, K, D]
