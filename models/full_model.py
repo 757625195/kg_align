@@ -128,13 +128,15 @@ class JointEAModel(nn.Module):
         neighbor_ids: torch.Tensor,   # [B, K]
         neighbor_mask: torch.Tensor,  # [B, K]
         edge_type: torch.Tensor = None,  # [E]
+        z_struct_all: torch.Tensor = None,  # [N, D]
     ):
         # 全图结构编码 + batch 级局部邻居提取，是当前轻量化设计的核心：
         # 用一次稀疏消息传递覆盖多跳上下文，再用固定邻居预算控制后续交互成本。
-        z_struct_all = self.encode_structure_all(
-            edge_index=edge_index,
-            edge_type=edge_type,
-        )    # [N, D]
+        if z_struct_all is None:
+            z_struct_all = self.encode_structure_all(
+                edge_index=edge_index,
+                edge_type=edge_type,
+            )    # [N, D]
 
         z_struct = z_struct_all[node_ids]                       # [B, D]
         z_neighbor = z_struct_all[neighbor_ids]                # [B, K, D]

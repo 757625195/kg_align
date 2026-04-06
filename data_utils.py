@@ -352,39 +352,3 @@ def load_dbp15k_raw_split(
         base["edge_type"] = relation_edge_type
         base["num_relations"] = num_relations
     return base
-
-
-def load_dbp15k_fixed_eval_split(
-    root: str = "data/dbp15k",
-    pair: str = "zh_en",
-) -> Dict:
-    base = load_dbp15k_from_pyg(root=root, pair=pair)
-
-    raw_pair_dir = os.path.join(root, "raw", pair)
-    left_map = _read_ent_id_mapping(os.path.join(raw_pair_dir, "ent_ids_1"))
-    right_map = _read_ent_id_mapping(os.path.join(raw_pair_dir, "ent_ids_2"))
-
-    train_pairs = _read_positive_examples(
-        path=os.path.join(raw_pair_dir, "train.examples.20"),
-        left_raw_to_local=left_map,
-        right_raw_to_local=right_map,
-        right_global_offset=base["n1"],
-    )
-    val_pairs = _read_positive_examples(
-        path=os.path.join(raw_pair_dir, "dev.examples.20"),
-        left_raw_to_local=left_map,
-        right_raw_to_local=right_map,
-        right_global_offset=base["n1"],
-    )
-    test_pairs = _read_positive_examples(
-        path=os.path.join(raw_pair_dir, "test.examples.1000"),
-        left_raw_to_local=left_map,
-        right_raw_to_local=right_map,
-        right_global_offset=base["n1"],
-    )
-
-    base["train_pairs"] = train_pairs
-    base["val_pairs"] = val_pairs
-    base["test_pairs"] = test_pairs
-    base["fixed_eval_split"] = True
-    return base

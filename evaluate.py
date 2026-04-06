@@ -17,9 +17,15 @@ def encode_entity_outputs(
     num_neighbors: int,
     batch_size: int,
     device: torch.device,
+    z_struct_all: torch.Tensor = None,
 ):
     model.eval()
     outputs = {}
+    if z_struct_all is None:
+        z_struct_all = model.encode_structure_all(
+            edge_index=edge_index,
+            edge_type=edge_type,
+        )
 
     for start in range(0, len(node_ids), batch_size):
         batch_ids = node_ids[start:start + batch_size].to(device)
@@ -39,6 +45,7 @@ def encode_entity_outputs(
             neighbor_ids=neighbor_ids,
             neighbor_mask=neighbor_mask,
             edge_type=edge_type,
+            z_struct_all=z_struct_all,
         )
         for key, value in out.items():
             if not torch.is_tensor(value):
@@ -63,6 +70,7 @@ def encode_entities(
     batch_size: int,
     device: torch.device,
     output_key: str = "z_joint",
+    z_struct_all: torch.Tensor = None,
 ):
     outputs = encode_entity_outputs(
         model=model,
@@ -74,6 +82,7 @@ def encode_entities(
         num_neighbors=num_neighbors,
         batch_size=batch_size,
         device=device,
+        z_struct_all=z_struct_all,
     )
     return outputs[output_key]
 
@@ -131,6 +140,10 @@ def evaluate_alignment(
         [right_index[r] for _, r in test_pairs],
         dtype=torch.long,
     )
+    z_struct_all = model.encode_structure_all(
+        edge_index=edge_index,
+        edge_type=edge_type,
+    )
 
     if fusion_weights is None:
         left_emb = encode_entities(
@@ -143,6 +156,7 @@ def evaluate_alignment(
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             device=device,
+            z_struct_all=z_struct_all,
         )
 
         right_emb = encode_entities(
@@ -155,6 +169,7 @@ def evaluate_alignment(
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             device=device,
+            z_struct_all=z_struct_all,
         )
     else:
         left_outputs = encode_entity_outputs(
@@ -167,6 +182,7 @@ def evaluate_alignment(
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             device=device,
+            z_struct_all=z_struct_all,
         )
         right_outputs = encode_entity_outputs(
             model=model,
@@ -178,6 +194,7 @@ def evaluate_alignment(
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             device=device,
+            z_struct_all=z_struct_all,
         )
         left_emb = fuse_entity_outputs(left_outputs, fusion_weights)
         right_emb = fuse_entity_outputs(right_outputs, fusion_weights)

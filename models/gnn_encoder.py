@@ -43,13 +43,18 @@ class DepthwiseSeparableGraphConv(nn.Module):
 
 class RelationAwareGraphConv(nn.Module):
     """
-    Lightweight relation-aware message passing:
-    - build messages from source node features plus relation embeddings
-    - mean aggregate on incoming edges
-    - adaptively mix self and neighbor information with a learned gate
+    Stable relation-aware message passing:
+    - relation embeddings are injected directly into propagated messages
+    - incoming neighbor evidence is mixed with an explicit self feature via a
+      learned gate, preserving the behavior of the strongest prior model
     """
 
-    def __init__(self, in_dim: int, out_dim: int, num_relations: int):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_relations: int,
+    ):
         super().__init__()
         self.rel_emb = nn.Embedding(num_relations, in_dim)
         self.src_proj = nn.Linear(in_dim, out_dim, bias=False)

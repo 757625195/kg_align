@@ -285,12 +285,8 @@ def total_loss(
     temperature: float = 0.07,
     neg_left_joint: torch.Tensor = None,
     neg_right_joint: torch.Tensor = None,
-    al_neg_left_joint: torch.Tensor = None,
-    al_neg_right_joint: torch.Tensor = None,
     margin: float = 0.2,
     hard_negative_weight: float = 1.0,
-    al_negative_weight: float = 1.0,
-    use_pairwise_hard_neg: bool = False,
     per_pair_hard_neg: bool = False,
     stable_neg_topk: int = 1,
     stable_ranking_topk: int = 1,
@@ -332,7 +328,6 @@ def total_loss(
             "struct_loss": struct_loss,
             "sem_loss": zero,
             "neg_loss": zero,
-            "al_neg_loss": zero,
             "ranking_loss": zero,
             "topology_loss": zero,
         }
@@ -384,28 +379,15 @@ def total_loss(
         semantic_consistency_loss(right_sem_branch, right_outputs["z_joint"])
     )
 
-    if use_pairwise_hard_neg:
-        neg_loss = hard_negative_weight * hardest_negative_ranking_loss(
-            pos_left=left_outputs["z_joint"],
-            pos_right=right_outputs["z_joint"],
-            margin=margin,
-        )
-    else:
-        neg_loss = margin_based_negative_loss(
-            pos_left=left_outputs["z_joint"],
-            pos_right=right_outputs["z_joint"],
-            neg_left=neg_left_joint,
-            neg_right=neg_right_joint,
-            margin=margin,
-            hard_weight=hard_negative_weight,
-            per_pair_hard=per_pair_hard_neg,
-            stable_topk=stable_neg_topk,
-        )
-
-    al_neg_loss = explicit_negative_pair_loss(
-        neg_left=al_neg_left_joint,
-        neg_right=al_neg_right_joint,
+    neg_loss = margin_based_negative_loss(
+        pos_left=left_outputs["z_joint"],
+        pos_right=right_outputs["z_joint"],
+        neg_left=neg_left_joint,
+        neg_right=neg_right_joint,
         margin=margin,
+        hard_weight=hard_negative_weight,
+        per_pair_hard=per_pair_hard_neg,
+        stable_topk=stable_neg_topk,
     )
 
     ranking_loss = hardest_negative_ranking_loss(
@@ -434,7 +416,6 @@ def total_loss(
         lambda_struct * struct_reg +
         lambda_sem * sem_reg +
         lambda_neg * neg_loss +
-        lambda_neg * al_negative_weight * al_neg_loss +
         lambda_ranking * ranking_loss +
         (lambda_topology * topology_scale) * topology_loss
     )
@@ -452,7 +433,6 @@ def total_loss(
         "struct_loss": struct_reg,
         "sem_loss": sem_reg,
         "neg_loss": neg_loss,
-        "al_neg_loss": al_neg_loss,
         "ranking_loss": ranking_loss,
         "topology_loss": topology_loss,
     }
