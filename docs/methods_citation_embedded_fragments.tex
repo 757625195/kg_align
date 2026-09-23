@@ -1,0 +1,627 @@
+% Paste-ready Section 3 aligned with the current codebase and with explicit
+% source-attribution / novelty statements for the advisor's requirement.
+% Citation keys assumed:
+% hamilton2017graphsage
+% schlichtkrull2018rgcn
+% zhu2021raga
+% mao2020rrea
+% vaswani2017attention
+% yang2016han
+% oord2018cpc
+% liu2021activeea
+% lin2022mclea
+% settles2009active
+
+\section{Design of the Collaborative Alignment Framework}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1\linewidth]{mainstructure.png}
+    \caption{Overall collaborative alignment framework}
+    \label{fig:main_framework}
+\end{figure}
+
+\subsection{Framework Overview}
+
+Heterogeneous knowledge graph alignment usually involves strong structural heterogeneity, substantial semantic discrepancy, and limited labeled pairs. An effective alignment model should therefore jointly exploit graph topology and semantic signals, map potentially equivalent entities into a shared latent space, and remain stable under sparse supervision. Existing studies often emphasize either structural aggregation or semantic matching, which makes it difficult to maintain robust alignment quality when the two graphs have different neighborhood patterns or when semantic features are noisy and incomplete.
+
+To address these difficulties, this study develops a collaborative alignment framework that integrates four tightly coupled components: a lightweight relation-aware structural encoder, a multi-scale semantic encoder, a confidence-aware cross-modal enhancement module, and an optional active learning loop. Given two heterogeneous knowledge graphs, the framework first encodes structural information and preprocessed semantic sequence features separately, then enhances and fuses the two views in a unified alignment space, and finally, when the active-learning protocol is enabled, improves the supervision set through iterative sample selection and feedback.
+
+\paragraph{Source of architectural ideas.}
+The overall idea of learning entity alignment in a shared representation space while jointly using structural and semantic evidence is related to prior entity-alignment models such as RAGA~\cite{zhu2021raga}, RREA~\cite{mao2020rrea}, and multi-view contrastive alignment frameworks such as MCLEA~\cite{lin2022mclea}. The structural branch is built on neighborhood aggregation and relation-aware graph modeling ideas from GraphSAGE~\cite{hamilton2017graphsage} and R-GCN~\cite{schlichtkrull2018rgcn}. The semantic branch is based on Transformer sequence modeling~\cite{vaswani2017attention} together with multi-granularity semantic representation ideas related to HAN~\cite{yang2016han}. The active query loop is motivated by ActiveEA~\cite{liu2021activeea} and by general active learning principles~\cite{settles2009active}. The main alignment objective further adopts the InfoNCE formulation from contrastive representation learning~\cite{oord2018cpc}.
+
+\paragraph{Potential novelty in this study.}
+Accordingly, this study does not claim novelty for GraphSAGE-style neighborhood aggregation, R-GCN-style relation-aware message passing, Transformer-based semantic encoding, active learning, or InfoNCE in themselves. The possible scientific novelty lies in the task-specific integration of these established components for heterogeneous knowledge graph alignment, especially the combination of lightweight relation-aware structural encoding, three-scale semantic modeling, confidence-aware bidirectional cross-modal enhancement, staged collaborative optimization, and active-learning-based reuse of both positive and negative feedback in one unified alignment space.
+
+\subsection{Lightweight Relation-aware Structural Modeling}
+
+\subsubsection{Design Motivation}
+
+The structural branch is designed to encode local neighborhoods and multi-hop topology while avoiding the heavy computational cost of large relation-parameterized graph models. The main purpose of this branch is to provide stable and expressive structural representations that can later interact with the semantic branch during fusion and alignment.
+
+\paragraph{Source of architectural ideas.}
+The basic neighborhood aggregation mechanism follows GraphSAGE~\cite{hamilton2017graphsage}. The incorporation of relation information into message construction is related to relation-aware graph modeling for knowledge graphs, especially R-GCN~\cite{schlichtkrull2018rgcn}. In addition, the use of relation-aware structural cues for entity alignment is consistent with relation-aware alignment models such as RAGA~\cite{zhu2021raga} and RREA~\cite{mao2020rrea}. Hence, the structural module is built on existing graph representation learning ideas rather than introduced here as a completely new GNN family.
+
+\paragraph{Potential novelty in this study.}
+The possible novelty of this module lies in the concrete lightweight configuration adopted for entity alignment, including relation-aware linear message construction, self/neighbor gating, node-wise layer selection across propagation depths, whole-graph pre-encoding for batch reuse, and fixed-budget neighbor extraction for downstream cross-modal interaction.
+
+\subsubsection{Relation-aware Multi-hop Structural Encoder}
+
+Let the unified relational graph be
+\[
+\mathcal{G}=(V,E,\mathcal{R}),
+\]
+where $V$ is the entity set, $E$ is the edge set, and $\mathcal{R}$ is the relation set. Each entity $e_i \in V$ is first assigned a trainable node embedding
+\[
+\mathbf{h}_i^{(0)} \in \mathbb{R}^{d}.
+\]
+
+For an edge $(j,r,i) \in E$, where node $j$ points to node $i$ with relation type $r$, the relation-aware neighbor evidence of node $i$ at layer $l$ is computed as
+\begin{equation}
+\bar{\mathbf{m}}_{i}^{(l)}
+=
+\frac{1}{|\mathcal{N}_{\mathrm{in}}(i)|}
+\sum_{j \in \mathcal{N}_{\mathrm{in}}(i)}
+\mathrm{LN}
+\left(
+\mathbf{W}_{s}^{(l)}\mathbf{h}_{j}^{(l)}
++
+\mathbf{W}_{r}^{(l)}\mathbf{e}_{r}
+\right),
+\end{equation}
+where $\mathbf{e}_{r}$ denotes the embedding of relation $r$ and $\mathrm{LN}(\cdot)$ denotes layer normalization.
+
+To preserve node identity, the model maintains a self-feature projection in parallel:
+\begin{equation}
+\mathbf{s}_{i}^{(l)}=\mathbf{W}_{\mathrm{self}}^{(l)}\mathbf{h}_{i}^{(l)}.
+\end{equation}
+A learnable gate then controls how much neighbor evidence is injected into the updated node state:
+\begin{equation}
+\mathbf{h}_{i}^{(l+1)}
+=
+\mathbf{s}_{i}^{(l)}
++
+\sigma
+\left(
+\mathbf{W}_{g}^{(l)}
+[\mathbf{s}_{i}^{(l)} \,\|\, \bar{\mathbf{m}}_{i}^{(l)}]
+\right)
+\odot
+\bar{\mathbf{m}}_{i}^{(l)}.
+\end{equation}
+For intermediate layers, normalization, ReLU, and dropout are further applied to improve stability.
+
+Instead of relying only on the deepest layer output, the encoder retains the input state together with all intermediate structural states and fuses them through node-wise layer selection. Let $\mathbf{u}_i^{(k)}$ denote the retained state at depth $k$, and let $\bar{\mathbf{u}}_i$ denote the mean context over all retained states. The final structural representation is obtained by
+\begin{equation}
+\tilde{\mathbf{z}}_i^{\mathrm{str}}
+=
+\sum_{k=0}^{L}
+\alpha_i^{(k)}\mathbf{u}_i^{(k)},
+\qquad
+\alpha_i^{(k)}
+=
+\mathrm{softmax}_{k}
+\Big(
+\mathrm{score}
+(
+[\mathbf{u}_i^{(k)} \,\|\, \bar{\mathbf{u}}_i]
+)
+\Big).
+\end{equation}
+The fused output is then normalized to produce the final structural embedding:
+\begin{equation}
+\mathbf{z}_i^{\mathrm{str}}
+=
+\frac{\mathrm{LN}(\tilde{\mathbf{z}}_i^{\mathrm{str}})}
+{\|\mathrm{LN}(\tilde{\mathbf{z}}_i^{\mathrm{str}})\|_2}.
+\end{equation}
+
+\subsubsection{Whole-graph Pre-encoding and Fixed-budget Neighbor Extraction}
+
+In the current implementation, structural encoding is performed once over the whole graph to obtain the structural embedding matrix of all entities. The current batch then indexes the target entities and their sampled neighbors from this matrix, rather than repeating full-graph message passing for every batch. This design preserves multi-hop structural context while reducing repeated structural computation.
+
+In addition, for each entity the implementation extracts a fixed-budget neighbor set
+\[
+\mathcal{N}_{K}(i)=\{n_{i1},n_{i2},\dots,n_{iK}\},
+\]
+together with a binary validity mask
+\[
+m_{ik}\in\{0,1\},
+\]
+which indicates whether the $k$-th sampled neighbor is valid. When relation-aware neighbor sampling is enabled, neighbors are ranked by relation rarity and node degree and then selected through a stable relation-diverse strategy. This fixed-budget neighbor extraction is used to provide local structural context for the downstream cross-modal module, rather than to replace the whole-graph structural encoder itself.
+
+\subsubsection{Structure-oriented Regularization}
+
+Structure-oriented supervision is mainly realized through structural branch alignment and structure-to-joint consistency. Let $\mathbf{z}_{L}^{\mathrm{str}+}$ and $\mathbf{z}_{R}^{\mathrm{str}+}$ denote the enhanced structural representations of a positive pair, and let $\mathbf{z}_{L}^{\mathrm{joint}}$ and $\mathbf{z}_{R}^{\mathrm{joint}}$ denote their final joint embeddings.
+
+The structural branch alignment objective is defined as
+\begin{equation}
+\mathcal{L}_{ba}(\mathbf{x},\mathbf{y})
+=
+\frac{1}{2}\mathrm{InfoNCE}(\mathbf{x},\mathbf{y})
++
+\frac{1}{2}\mathrm{SmoothL1}(\mathbf{x},\mathbf{y}),
+\end{equation}
+and the structural branch alignment term is
+\begin{equation}
+\mathcal{L}_{align}^{\mathrm{str}}
+=
+\mathcal{L}_{ba}(\mathbf{z}_{L}^{\mathrm{str}+}, \mathbf{z}_{R}^{\mathrm{str}+}).
+\end{equation}
+
+To preserve structural evidence in the final alignment space, the model further constrains the enhanced structural branch to stay close to the joint branch through
+\begin{equation}
+\mathcal{L}_{cons}(\mathbf{x},\mathbf{y})
+=
+\frac{1}{2}
+\left[
+1-\frac{\mathbf{x}^{\top}\mathbf{y}}{\|\mathbf{x}\|_2\|\mathbf{y}\|_2}
+\right]
++
+\frac{1}{2}\mathrm{SmoothL1}(\mathbf{x},\mathbf{y}),
+\end{equation}
+which yields the structural regularization term
+\begin{equation}
+\mathcal{L}_{\mathrm{str}}
+=
+\frac{1}{2}
+\left(
+\mathcal{L}_{cons}(\mathbf{z}_{L}^{\mathrm{str}+},\mathbf{z}_{L}^{\mathrm{joint}})
++
+\mathcal{L}_{cons}(\mathbf{z}_{R}^{\mathrm{str}+},\mathbf{z}_{R}^{\mathrm{joint}})
+\right).
+\end{equation}
+
+\subsection{Multi-scale Semantic Modeling}
+
+\subsubsection{Design Motivation}
+
+The semantic branch is designed to model entity semantics at multiple granularities, because entity-level semantic evidence in knowledge graphs is rarely captured well by a single global vector. Local lexical cues, phrase-level patterns, and long-range contextual semantics may contribute differently to alignment decisions. Accordingly, the semantic branch explicitly decomposes semantic encoding into token-level, phrase-level, and global contextual views and then fuses them into one semantic representation.
+
+\paragraph{Source of architectural ideas.}
+The semantic branch adopts the Transformer backbone from Vaswani et al.~\cite{vaswani2017attention}. The idea of modeling semantics at more than one granularity is related to hierarchical semantic representation methods such as HAN~\cite{yang2016han}. Therefore, self-attention, positional encoding, and multi-granularity semantic decomposition are not introduced here from scratch.
+
+\paragraph{Potential novelty in this study.}
+The possible novelty of this module lies in its task-specific combination of token-level, phrase-level, and global contextual branches for entity alignment, together with gated rescaling, concatenation-based fusion, and residual projection into a unified semantic space.
+
+\subsubsection{Token-, Phrase-, and Global-level Encoding}
+
+Given the semantic sequence feature of entity $e_i$,
+\[
+\mathbf{S}_i \in \mathbb{R}^{L \times d_{in}},
+\]
+the input is first projected into the hidden space and enriched with layer normalization, sinusoidal positional encoding, and dropout:
+\begin{equation}
+\mathbf{X}_i
+=
+\mathrm{Dropout}
+\left(
+\mathrm{PE}
+\left(
+\mathrm{LN}(\mathbf{S}_i\mathbf{W}_{in}+\mathbf{b}_{in})
+\right)
+\right).
+\end{equation}
+
+Based on $\mathbf{X}_i$, the encoder extracts three semantic views. The token-level representation is computed by combining masked mean pooling and masked attention pooling:
+\begin{equation}
+\mathbf{z}_i^{\mathrm{tok}}
+=
+\frac{1}{2}
+\left(
+\mathrm{MeanPool}(\mathbf{X}_i)
++
+\mathrm{AttnPool}(\mathbf{X}_i)
+\right).
+\end{equation}
+
+To capture local phrase patterns, the model applies one-dimensional convolutions with kernel sizes $3$ and $5$ and combines them with the original sequence through residual normalization:
+\begin{equation}
+\mathbf{H}_i^{\mathrm{phr}}
+=
+\mathrm{LN}
+\left(
+\mathbf{X}_i
++
+\frac{1}{2}
+\left(
+\mathrm{Conv}_{3}(\mathbf{X}_i)
++
+\mathrm{Conv}_{5}(\mathbf{X}_i)
+\right)
+\right).
+\end{equation}
+The phrase-level representation is then
+\begin{equation}
+\mathbf{z}_i^{\mathrm{phr}}
+=
+\frac{1}{2}
+\left(
+\mathrm{MeanPool}(\mathbf{H}_i^{\mathrm{phr}})
++
+\mathrm{AttnPool}(\mathbf{H}_i^{\mathrm{phr}})
+\right).
+\end{equation}
+
+For global contextual modeling, the sequence is further encoded by a multi-layer Transformer encoder:
+\begin{equation}
+\mathbf{H}_i^{\mathrm{glb}}
+=
+\mathrm{Transformer}(\mathbf{X}_i),
+\end{equation}
+and the global semantic representation is obtained by
+\begin{equation}
+\mathbf{z}_i^{\mathrm{glb}}
+=
+\frac{1}{2}
+\left(
+\mathrm{MeanPool}(\mathbf{H}_i^{\mathrm{glb}})
++
+\mathrm{AttnPool}(\mathbf{H}_i^{\mathrm{glb}})
+\right).
+\end{equation}
+
+\subsubsection{Gated Multi-scale Fusion}
+
+After obtaining the three semantic representations, the model estimates their relative contribution through a gating network:
+\begin{equation}
+\boldsymbol{\alpha}_i
+=
+\mathrm{softmax}
+\left(
+\mathrm{MLP}_{gate}
+\left(
+[\mathbf{z}_i^{\mathrm{tok}};\mathbf{z}_i^{\mathrm{phr}};\mathbf{z}_i^{\mathrm{glb}}]
+\right)
+\right).
+\end{equation}
+
+Instead of directly summing the three branches, the implementation first rescales each branch by its gate weight and then concatenates them:
+\begin{equation}
+\mathbf{f}_i
+=
+[
+\alpha_i^{(1)}\mathbf{z}_i^{\mathrm{tok}};
+\alpha_i^{(2)}\mathbf{z}_i^{\mathrm{phr}};
+\alpha_i^{(3)}\mathbf{z}_i^{\mathrm{glb}}
+].
+\end{equation}
+The concatenated representation is then projected into the semantic space, followed by a residual connection from the global branch:
+\begin{equation}
+\tilde{\mathbf{z}}_i^{\mathrm{sem}}
+=
+\mathrm{MLP}_{out}(\mathbf{f}_i)
++
+\mathbf{W}_{res}\mathbf{z}_i^{\mathrm{glb}},
+\end{equation}
+and the final semantic representation is defined as
+\begin{equation}
+\mathbf{z}_i^{\mathrm{sem}}
+=
+\frac{\tilde{\mathbf{z}}_i^{\mathrm{sem}}}{\|\tilde{\mathbf{z}}_i^{\mathrm{sem}}\|_2}.
+\end{equation}
+
+\subsection{Confidence-aware Cross-modal Enhancement}
+
+\subsubsection{Design Motivation}
+
+After obtaining structural and semantic embeddings, the model performs cross-modal enhancement rather than direct late fusion. The purpose is to let semantic cues influence the use of structural neighbors and, conversely, let structural context regulate semantic updating, so that the final alignment representation reflects coordinated evidence from both views.
+
+\paragraph{Source of architectural ideas.}
+The attention form used in this module follows the general query-key-value mechanism introduced in the Transformer~\cite{vaswani2017attention}. More broadly, the idea of allowing multiple views to interact in a shared alignment space is related to multi-view alignment frameworks such as MCLEA~\cite{lin2022mclea}. However, these prior studies do not provide the exact bidirectional enhancement mechanism used here.
+
+\paragraph{Potential novelty in this study.}
+The possible novelty of this module lies in the concrete bidirectional design: semantic representations first query structural neighbors, the resulting structural context then reversely regulates semantic updating, and the two branches are finally integrated through confidence-aware gated fusion and agreement-aware residual refinement.
+
+\subsubsection{Structure--Semantic Bidirectional Enhancement}
+
+Let $\mathbf{s}_i$ denote the semantic representation of entity $e_i$, $\mathbf{t}_i^{self}$ denote its self structural representation, and $\{\mathbf{t}_{i,k}\}_{k=1}^{K}$ denote the sampled structural neighbors. A pairwise interaction function is defined as
+\begin{equation}
+\phi(\mathbf{x}, \mathbf{y})
+=
+[\mathbf{x};\mathbf{y};\mathbf{x}\odot\mathbf{y};|\mathbf{x}-\mathbf{y}|].
+\end{equation}
+
+The semantic branch first queries structural neighbors through cross-modal attention. A semantic consistency gate is estimated for each neighbor:
+\begin{equation}
+\gamma_{i,k}
+=
+\sigma\!\left(
+\mathbf{w}_{n}^{\top}\phi(\mathbf{t}_{i,k}, \mathbf{s}_i)
+\right).
+\end{equation}
+The corresponding neighbor attention score is
+\begin{equation}
+a_{i,k}
+=
+\frac{
+(\mathbf{W}_{q}^{sem}\mathbf{s}_i)^{\top}
+(\mathbf{W}_{k}^{str}\mathbf{t}_{i,k})
+}{\sqrt{d}}
++
+\log \gamma_{i,k},
+\end{equation}
+and the aggregated structural neighbor context is
+\begin{equation}
+\mathbf{n}_i^{\mathrm{str}}
+=
+\sum_{k=1}^{K}\alpha_{i,k}\mathbf{W}_{v}^{str}\mathbf{t}_{i,k}.
+\end{equation}
+The final structural context is defined as
+\begin{equation}
+\mathbf{c}_i^{\mathrm{str}}
+=
+\frac{1}{2}
+\left(
+\mathbf{t}_i^{self}
++
+\mathbf{n}_i^{\mathrm{str}}
+\right),
+\end{equation}
+or falls back to $\mathbf{t}_i^{self}$ when valid neighbors are unavailable.
+
+On this basis, the model estimates how strongly structural context should influence the semantic branch:
+\begin{equation}
+\rho_i
+=
+\sigma
+\left(
+\frac{
+(\mathbf{W}_{q}^{str}\mathbf{c}_i^{\mathrm{str}})^{\top}
+(\mathbf{W}_{k}^{sem}\mathbf{s}_i)
+}{\sqrt{d}}
+\right).
+\end{equation}
+This produces semantic and structural residual updates:
+\begin{equation}
+\Delta \mathbf{s}_i
+=
+\tanh
+\left(
+\mathrm{MLP}_{str\rightarrow sem}
+\left(
+[\mathbf{s}_i;\rho_i\mathbf{c}_i^{\mathrm{str}}]
+\right)
+\right),
+\qquad
+\Delta \mathbf{t}_i
+=
+\tanh
+\left(
+\mathrm{MLP}_{sem\rightarrow str}
+\left(
+[\mathbf{t}_i^{self};\rho_i\mathbf{s}_i]
+\right)
+\right).
+\end{equation}
+
+To avoid excessive perturbation, the residual updates are further controlled by branch-specific gates and a confidence term:
+\begin{equation}
+\mathbf{g}_i^{\mathrm{sem}}
+=
+\sigma\!\left(\mathbf{W}_{sem}\phi(\mathbf{s}_i,\mathbf{c}_i^{\mathrm{str}})\right),
+\qquad
+\mathbf{g}_i^{\mathrm{str}}
+=
+\sigma\!\left(\mathbf{W}_{str}\phi(\mathbf{t}_i^{self},\mathbf{s}_i)\right),
+\end{equation}
+\begin{equation}
+\xi_i
+=
+\sigma\!\left(\mathbf{w}_{c}^{\top}\phi(\mathbf{s}_i,\mathbf{c}_i^{\mathrm{str}})\right)
+\cdot
+\sigma\!\left(
+5\left(
+\mathbf{s}_i^{\top}\mathbf{t}_i^{self}
+-
+\max_k \mathbf{s}_i^{\top}\mathbf{t}_{i,k}
+\right)
+\right).
+\end{equation}
+The enhanced semantic and structural representations are then
+\begin{equation}
+\mathbf{s}_i^{+}
+=
+\mathrm{Norm}
+\left(
+\mathbf{s}_i
++
+\lambda\,\xi_i\odot\mathbf{g}_i^{\mathrm{sem}}\odot\Delta\mathbf{s}_i
+\right),
+\qquad
+\mathbf{t}_i^{+}
+=
+\mathrm{Norm}
+\left(
+\mathbf{t}_i^{self}
++
+\lambda\,\xi_i\odot\mathbf{g}_i^{\mathrm{str}}\odot\Delta\mathbf{t}_i
+\right).
+\end{equation}
+
+\subsubsection{Joint Representation Construction}
+
+Based on the enhanced branches, the model builds the interaction feature
+\begin{equation}
+\mathbf{u}_i
+=
+\phi(\mathbf{s}_i^{+},\mathbf{t}_i^{+}).
+\end{equation}
+A learned mixture gate is used to balance semantic and structural evidence:
+\begin{equation}
+\mathbf{m}_i
+=
+\sigma(\mathbf{W}_{mix}\mathbf{u}_i),
+\qquad
+\tilde{\mathbf{z}}_i^{base}
+=
+\frac{1}{2}
+\left(
+\mathbf{m}_i\odot\mathbf{t}_i^{+}
++
+(1-\mathbf{m}_i)\odot\mathbf{s}_i^{+}
++
+\frac{\mathbf{s}_i^{+}+\mathbf{t}_i^{+}}{2}
+\right).
+\end{equation}
+An agreement-aware residual refinement term is then introduced:
+\begin{equation}
+\Delta \mathbf{z}_i
+=
+\tanh(\mathrm{MLP}_{joint}(\mathbf{u}_i)),
+\qquad
+\mathbf{r}_i
+=
+\sigma(\mathbf{W}_{agr}\mathbf{u}_i).
+\end{equation}
+Finally, the joint alignment representation is computed as
+\begin{equation}
+\mathbf{z}_i^{\mathrm{joint}}
+=
+\mathrm{Norm}
+\left(
+\mathrm{LN}
+\left(
+\tilde{\mathbf{z}}_i^{base}
++
+\xi_i\odot\mathbf{r}_i\odot\Delta\mathbf{z}_i
+\right)
+\right).
+\end{equation}
+
+\subsection{Alignment Objective, Training Strategy, and Active Learning}
+
+\subsubsection{Joint Alignment Objective and Staged Optimization}
+
+The current implementation uses the joint representation $\mathbf{z}^{\mathrm{joint}}$ as the final alignment representation. During training, the main matching objective is based on temperature-scaled cosine similarity:
+\begin{equation}
+s(e_i,e_j)
+=
+\frac{
+\cos\!\left(
+\mathbf{z}_i^{\mathrm{joint}},
+\mathbf{z}_j^{\mathrm{joint}}
+\right)
+}{\tau}.
+\end{equation}
+In retrieval, the alignment head further supports CSLS-based correction on top of cosine similarity during ranking.
+
+\paragraph{Source of architectural ideas.}
+The main alignment objective adopts the bidirectional InfoNCE contrastive formulation from CPC~\cite{oord2018cpc}. Temperature-scaled cosine matching is also standard practice in contrastive representation learning. Hence, the basic alignment loss itself is not introduced as a new loss principle.
+
+\paragraph{Potential novelty in this study.}
+The possible novelty here lies in the way the losses are jointly organized for entity alignment, including structural warmup, branch-level and cross-branch consistency, sampled negative supervision, explicit negative supervision from active learning, and staged strengthening of auxiliary constraints during joint training.
+
+The training procedure follows a two-stage strategy. In the warmup stage, the model optimizes only a structural self-supervised stabilization loss in order to prevent the structural space from collapsing before joint training begins. In the joint-training stage, the main alignment objective is a bidirectional InfoNCE loss:
+\begin{equation}
+\mathcal{L}_{\mathrm{align}}
+=
+\mathrm{InfoNCE}
+\left(
+\mathbf{z}_{L}^{\mathrm{joint}},
+\mathbf{z}_{R}^{\mathrm{joint}}
+\right).
+\end{equation}
+
+To further stabilize the unified alignment space, the model introduces several auxiliary constraints. Branch-level alignment is imposed on both the enhanced structural branch and the enhanced semantic branch, so that aligned entities remain comparable in each individual space. Cross-modal consistency and joint-branch consistency are further used to reduce discrepancies among structural, semantic, and joint representations. Meanwhile, both the structural branch and the semantic branch are regularized toward the joint space.
+
+To improve discrimination over hard samples, the joint-training stage also includes sampled negative-pair loss, explicit negative-pair loss obtained from active learning feedback, and a ranking loss. Since these auxiliary objectives may introduce excessive perturbation at the early stage of joint training, the model does not activate them all at once. Instead, a ramp-up mechanism is adopted so that branch alignment, cross-modal consistency, and joint-branch consistency are progressively strengthened as training proceeds.
+
+The total objective in the joint-training stage is
+\begin{equation}
+\begin{aligned}
+\mathcal{L}
+=
+&\ \mathcal{L}_{\mathrm{align}}
++
+\lambda_b \omega_b \mathcal{L}_{\mathrm{branch}}
++
+\lambda_c \omega_c \mathcal{L}_{\mathrm{cross}}
++
+\lambda_j \omega_j \mathcal{L}_{\mathrm{joint\mbox{-}branch}} \\
+&+
+\lambda_s \mathcal{L}_{\mathrm{str}}
++
+\lambda_m \mathcal{L}_{\mathrm{sem}}
++
+\lambda_n \mathcal{L}_{\mathrm{neg}}
++
+\lambda_n \lambda_{al}\mathcal{L}_{\mathrm{al\mbox{-}neg}}
++
+\lambda_r \mathcal{L}_{\mathrm{rank}},
+\end{aligned}
+\end{equation}
+where $\omega_b,\omega_c,\omega_j$ are ramp-up weights for progressively activating auxiliary constraints.
+
+Overall, this training strategy follows a ``stabilize first, then enhance'' principle. In the early stage, the model mainly focuses on stabilizing the structural space and establishing basic alignment relations. In the later stage, it gradually strengthens branch alignment, cross-modal consistency, joint-branch coordination, and hard-negative discrimination, thereby improving the quality of the unified alignment space.
+
+\subsubsection{Active-learning-driven Sample Selection and Feedback}
+
+When the active-learning protocol is enabled, the model periodically evaluates a candidate pool in the unified alignment space and selects the most informative entity pairs for feedback. This design is introduced to reduce annotation cost and to avoid naive pseudo-label expansion.
+
+\paragraph{Source of architectural ideas.}
+The active query mechanism follows general active learning principles~\cite{settles2009active} and is most closely related to annotation-efficient entity alignment methods such as ActiveEA~\cite{liu2021activeea}. In particular, the idea of querying informative candidate pairs during training is inherited from this line of work rather than proposed here for the first time.
+
+\paragraph{Potential novelty in this study.}
+The possible novelty here lies in the concrete acquisition-and-feedback design for the unified alignment space: candidate scoring combines bidirectional uncertainty with representativeness from joint, enhanced structural, and enhanced semantic views; filtering is adaptively relaxed when too few candidates remain; diversity reranking can be added; and confirmed negative pairs are stored and reused as explicit supervision instead of being discarded.
+
+For each left-side candidate, the model first retrieves its current best-matched right-side entity and forms a candidate pair. The acquisition score combines uncertainty and pair-level representativeness:
+\begin{equation}
+\mathrm{Score}(x)
+=
+\lambda_u U(x) + \lambda_r R(x),
+\end{equation}
+where $U(x)$ denotes uncertainty and $R(x)$ denotes representativeness.
+
+The uncertainty term is estimated bidirectionally from the prediction distribution by combining entropy and margin:
+\begin{equation}
+U(x)
+=
+\frac{1}{2}\mathrm{Entropy}(x)
++
+\frac{1}{2}\left(1-\mathrm{Margin}(x)\right).
+\end{equation}
+
+The representativeness term is estimated jointly from the unified space, the enhanced structural space, and the enhanced semantic space:
+\begin{equation}
+R(x)
+=
+\alpha R_{\mathrm{joint}}(x)
++
+\beta R_{\mathrm{str}}(x)
++
+\gamma R_{\mathrm{sem}}(x),
+\qquad
+\alpha+\beta+\gamma=1.
+\end{equation}
+
+After ranking candidate pairs by $\mathrm{Score}(x)$, the implementation applies filtering based on confidence, margin, uncertainty range, and optional bidirectional consistency. To avoid over-filtering, the current code further adopts an adaptive relaxation strategy that gradually loosens the filtering conditions when too few candidates remain. A diversity-based reranking step can then be applied to reduce redundancy among the selected pairs.
+
+The final feedback is not limited to positive pairs. Confirmed positive pairs are added back into the training set for incremental optimization, while confirmed negative pairs are stored and later reused as explicit negative supervision. In the current implementation, this feedback is simulated by an oracle-style protocol based on ground-truth aligned pairs during experiments. In this way, the framework forms a closed loop of
+\begin{equation}
+\text{training}
+\rightarrow
+\text{candidate scoring}
+\rightarrow
+\text{sample selection}
+\rightarrow
+\text{positive/negative feedback}
+\rightarrow
+\text{continued training}.
+\end{equation}
+
+\subsection{Complexity and Scalability Discussion}
+
+From the perspective of the current implementation, the efficiency of the framework mainly comes from three design choices. First, the structural branch relies on sparse edge-based propagation and whole-graph pre-encoding. For a graph with $|E|$ edges and $L$ propagation layers, the dominant structural cost scales with sparse message passing over observed edges rather than dense pairwise interactions. After structural pre-encoding, each batch only indexes the target entities and their fixed-budget sampled neighbors, so subsequent local interaction is controlled by the budget $K$ rather than by full-neighborhood expansion.
+
+Second, the semantic branch uses a compact multi-scale design rather than multiple separate encoders. Local phrase modeling is handled by lightweight convolutional branches, while global contextual semantics are encoded once by the Transformer backbone. This reduces redundant semantic computation and preserves a clear separation between local and global text features.
+
+Third, the cross-modal and active-learning components are lightweight relative to the main encoders. The cross-modal module mainly consists of linear projections, gating functions, and small multilayer perceptrons. The active learning module is invoked periodically rather than at every optimization step and directly reuses the learned joint space for sample scoring.
+
+As a result, the whole framework maintains a practical balance between alignment quality and computational cost. Its lightweight GNN design, whole-graph caching strategy, fixed-budget neighbor extraction, and compact semantic fusion mechanism all support more scalable deployment on large knowledge graphs.
+
+\subsection{Summary}
+
+This chapter has presented a collaborative alignment framework for heterogeneous knowledge graphs that integrates lightweight structural encoding, multi-scale semantic modeling, confidence-aware cross-modal enhancement, and active-learning-driven optimization. At the framework level, the model constructs a unified alignment space in which structural and semantic features are jointly optimized. At the module level, it uses a lightweight relation-aware GNN to capture graph structure, a three-scale Transformer-based semantic encoder to model entity semantics, and a bidirectional cross-modal enhancement module to refine the final alignment representation. At the optimization level, it combines contrastive alignment, branch consistency, hard-negative supervision, and active sample selection in one iterative training loop.
+
+The framework is built on several established research lines, including graph representation learning, Transformer-based semantic encoding, shared-space entity alignment, contrastive learning, and active learning. Therefore, its potential contribution lies not in inventing each ingredient independently, but in organizing them into a coherent collaborative system and in clarifying which task-specific mechanisms may provide scientific novelty for heterogeneous knowledge graph alignment.

@@ -1,0 +1,34 @@
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.pycache_tmp/
+*.pyc
+*.pyo
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Local outputs
+outputs/
+tmp/
+template_work/
+migration/
+.mplconfig/
+tmp_*.txt
+tmp_report_extracted.txt
+
+# Datasets and third-party checkouts are restored separately.
+data/
+third_party/

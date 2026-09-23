@@ -1,0 +1,8 @@
+# Core environment used for the entity-alignment experiments.
+# Original environment: Python 3.9.6
+numpy==2.0.2
+torch==2.8.0
+torch-geometric==2.6.1
+networkx==3.2.1
+tqdm==4.67.3
+requests==2.32.5

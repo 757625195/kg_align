@@ -1,111 +1,101 @@
-from typing import Dict, List, Tuple, Union
-import math
+from typing import Dict, List
 
 import torch
 
 
-NeighborEntry = Union[int, Tuple[int, int, float, int]]
+def build_topology_features(edge_index, edge_type, num_nodes, graph_sizes):
+    """Build relation-ID-invariant local topology statistics for both KGs."""
+    edge_index = edge_index.detach().cpu()
+    edge_type = edge_type.detach().cpu()
+    src, dst = edge_index
+    ones = torch.ones(src.numel(), dtype=torch.float32)
+    in_degree = torch.zeros(num_nodes).index_add_(0, dst, ones)
+    out_degree = torch.zeros(num_nodes).index_add_(0, src, ones)
+    total_degree = in_degree + out_degree
+
+    incoming_relations = [set() for _ in range(num_nodes)]
+    outgoing_relations = [set() for _ in range(num_nodes)]
+    for source, target, relation in zip(src.tolist(), dst.tolist(), edge_type.tolist()):
+        outgoing_relations[source].add(relation)
+        incoming_relations[target].add(relation)
+    in_rel_diversity = torch.tensor([len(x) for x in incoming_relations], dtype=torch.float32)
+    out_rel_diversity = torch.tensor([len(x) for x in outgoing_relations], dtype=torch.float32)
+
+    log_neighbor_degree = torch.log1p(total_degree)
+    out_neighbor_mean = (
+        torch.zeros(num_nodes).index_add_(0, src, log_neighbor_degree[dst])
+        / out_degree.clamp(min=1.0)
+    )
+    in_neighbor_mean = (
+        torch.zeros(num_nodes).index_add_(0, dst, log_neighbor_degree[src])
+        / in_degree.clamp(min=1.0)
+    )
+    direction_balance = (out_degree - in_degree) / total_degree.clamp(min=1.0)
+    features = torch.stack([
+        torch.log1p(in_degree), torch.log1p(out_degree), torch.log1p(total_degree),
+        torch.log1p(in_rel_diversity), torch.log1p(out_rel_diversity),
+        in_neighbor_mean, out_neighbor_mean, direction_balance,
+    ], dim=-1)
+
+    normalized = torch.empty_like(features)
+    offset = 0
+    for graph_size in graph_sizes:
+        part = features[offset:offset + graph_size]
+        normalized[offset:offset + graph_size] = (
+            (part - part.mean(dim=0, keepdim=True))
+            / part.std(dim=0, unbiased=False, keepdim=True).clamp(min=1e-6)
+        )
+        offset += graph_size
+    if offset != num_nodes:
+        raise ValueError("graph_sizes must sum to num_nodes")
+    return normalized
 
 
 def build_adj_list(
     edge_index: torch.Tensor,
     num_nodes: int,
-    edge_type: torch.Tensor = None,
-    use_relation_aware: bool = False,
-    relation_score_alpha: float = 1.0,
-    neighbor_degree_alpha: float = 0.25,
-) -> Dict[int, List[NeighborEntry]]:
-    if edge_type is None or not use_relation_aware:
-        adj = {i: [] for i in range(num_nodes)}
-        src = edge_index[0].tolist()
-        dst = edge_index[1].tolist()
-        for s, d in zip(src, dst):
-            adj[s].append(d)
-        return adj
-
+) -> Dict[int, List[int]]:
+    """Build a deterministic outgoing-neighbor list for each entity."""
+    adj = {i: [] for i in range(num_nodes)}
     src = edge_index[0].tolist()
     dst = edge_index[1].tolist()
-    rel = edge_type.tolist()
-
-    relation_counts = torch.bincount(edge_type.cpu(), minlength=int(edge_type.max().item()) + 1).float()
-    out_degree = torch.bincount(edge_index[0].cpu(), minlength=num_nodes).float()
-    in_degree = torch.bincount(edge_index[1].cpu(), minlength=num_nodes).float()
-    total_degree = out_degree + in_degree
-
-    adj_maps: List[Dict[int, Tuple[int, float, int]]] = [dict() for _ in range(num_nodes)]
-    for order, (s, d, r) in enumerate(zip(src, dst, rel)):
-        rel_score = relation_score_alpha / math.sqrt(float(relation_counts[r].item()) + 1.0)
-        degree_score = neighbor_degree_alpha / math.sqrt(float(total_degree[d].item()) + 1.0)
-        score = rel_score + degree_score
-
-        existing = adj_maps[s].get(d)
-        if existing is None or score > existing[1] or (score == existing[1] and order < existing[2]):
-            adj_maps[s][d] = (r, score, order)
-
-    adj: Dict[int, List[NeighborEntry]] = {}
-    for node_id in range(num_nodes):
-        entries = [
-            (neighbor_id, relation_id, score, order)
-            for neighbor_id, (relation_id, score, order) in adj_maps[node_id].items()
-        ]
-        entries.sort(key=lambda item: (-item[2], item[3], item[0]))
-        adj[node_id] = entries
+    for source, target in zip(src, dst):
+        adj[source].append(target)
     return adj
-
-
-def _pick_relation_aware_neighbors(
-    neighbors: List[Tuple[int, int, float, int]],
-    num_neighbors: int,
-) -> List[int]:
-    if len(neighbors) <= num_neighbors:
-        return [neighbor_id for neighbor_id, _, _, _ in neighbors]
-
-    relation_buckets: Dict[int, List[Tuple[int, float, int]]] = {}
-    for neighbor_id, relation_id, score, order in neighbors:
-        relation_buckets.setdefault(relation_id, []).append((neighbor_id, score, order))
-
-    relation_order = sorted(
-        relation_buckets.keys(),
-        key=lambda relation_id: (
-            -relation_buckets[relation_id][0][1],
-            relation_buckets[relation_id][0][2],
-            relation_id,
-        ),
-    )
-
-    bucket_pos = {relation_id: 0 for relation_id in relation_order}
-    picked: List[int] = []
-    while len(picked) < num_neighbors:
-        progressed = False
-        for relation_id in relation_order:
-            pos = bucket_pos[relation_id]
-            bucket = relation_buckets[relation_id]
-            if pos >= len(bucket):
-                continue
-            picked.append(bucket[pos][0])
-            bucket_pos[relation_id] += 1
-            progressed = True
-            if len(picked) >= num_neighbors:
-                break
-        if not progressed:
-            break
-    return picked
 
 
 def sample_neighbors(
     node_ids: torch.Tensor,
-    adj_list: Dict[int, List[NeighborEntry]],
+    adj_list: Dict[int, List[int]],
     num_neighbors: int,
     device: torch.device,
 ):
-    """
-    为每个节点稳定选择 K 个邻居。
+    """Collect deterministic neighbors with fixed or batch-local width.
 
-    当邻接表包含 relation-aware 条目时，先按关系稀有度和邻居非 hub 程度
-    预排序，再用 relation-diverse round-robin 方式选取，避免同一种关系占满
-    全部邻居预算；否则退化为固定顺序截取。
+    A positive ``num_neighbors`` preserves the fixed-budget protocol. A
+    non-positive value retains every outgoing adjacency entry and pads only to
+    the largest neighborhood in the current batch.
     """
     batch_ids = node_ids.detach().cpu().tolist()
+
+    if num_neighbors <= 0:
+        neighborhoods = [adj_list.get(nid, []) for nid in batch_ids]
+        batch_width = max(
+            1,
+            max((len(neighbors) for neighbors in neighborhoods), default=0),
+        )
+        neigh_ids = []
+        neigh_mask = []
+        for nid, neighbors in zip(batch_ids, neighborhoods):
+            valid_count = len(neighbors)
+            padding = batch_width - valid_count
+            neigh_ids.append([*neighbors, *([nid] * padding)])
+            neigh_mask.append([*([1] * valid_count), *([0] * padding)])
+
+        return (
+            torch.tensor(neigh_ids, dtype=torch.long, device=device),
+            torch.tensor(neigh_mask, dtype=torch.long, device=device),
+        )
 
     neigh_ids = []
     neigh_mask = []
@@ -117,11 +107,7 @@ def sample_neighbors(
             ids = [nid] * num_neighbors
             mask = [0] * num_neighbors
         else:
-            first_entry = neighbors[0]
-            if isinstance(first_entry, tuple):
-                picked = _pick_relation_aware_neighbors(neighbors, num_neighbors)
-            else:
-                picked = neighbors[:num_neighbors]
+            picked = neighbors[:num_neighbors]
 
             if len(picked) >= num_neighbors:
                 ids = picked[:num_neighbors]

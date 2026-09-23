@@ -73,8 +73,24 @@ class MultiScaleTransformerEncoder(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        use_token_view: bool = True,
+        use_phrase_view: bool = True,
+        use_global_view: bool = True,
+        residual_mode: str = "gated",
     ):
         super().__init__()
+        if not (use_token_view or use_phrase_view or use_global_view):
+            raise ValueError("At least one semantic view must be enabled.")
+        if residual_mode not in {"legacy_global", "gated", "gated_no_global"}:
+            raise ValueError(
+                f"Unsupported residual_mode={residual_mode!r}; "
+                "expected 'legacy_global', 'gated', or 'gated_no_global'"
+            )
+
+        self.use_token_view = use_token_view
+        self.use_phrase_view = use_phrase_view
+        self.use_global_view = use_global_view
+        self.residual_mode = residual_mode
 
         self.input_proj = nn.Linear(in_dim, embed_dim)
         self.input_norm = nn.LayerNorm(embed_dim)
@@ -144,14 +160,27 @@ class MultiScaleTransformerEncoder(nn.Module):
         phrase_attn = self.phrase_pool(phrase_hidden, mask)
         phrase_repr = 0.5 * (phrase_mean + phrase_attn)
 
-        key_padding_mask = (mask == 0)
-        trans_out = self.transformer(x, src_key_padding_mask=key_padding_mask)
-        global_mean = self.mean_pool(trans_out, mask)
-        global_attn = self.global_pool(trans_out, mask)
-        global_repr = 0.5 * (global_mean + global_attn)
+        if self.use_global_view:
+            key_padding_mask = mask == 0
+            trans_out = self.transformer(x, src_key_padding_mask=key_padding_mask)
+            global_mean = self.mean_pool(trans_out, mask)
+            global_attn = self.global_pool(trans_out, mask)
+            global_repr = 0.5 * (global_mean + global_attn)
+        else:
+            global_repr = torch.zeros_like(token_repr)
+
+        token_repr = token_repr if self.use_token_view else torch.zeros_like(token_repr)
+        phrase_repr = phrase_repr if self.use_phrase_view else torch.zeros_like(phrase_repr)
 
         concat = torch.cat([token_repr, phrase_repr, global_repr], dim=-1)
-        gate = F.softmax(self.gate(concat), dim=-1)
+        gate_logits = self.gate(concat)
+        active_mask = torch.tensor(
+            [self.use_token_view, self.use_phrase_view, self.use_global_view],
+            device=gate_logits.device,
+            dtype=torch.bool,
+        )
+        gate_logits = gate_logits.masked_fill(~active_mask.unsqueeze(0), -1e9)
+        gate = F.softmax(gate_logits, dim=-1)
 
         fused = torch.cat([
             token_repr * gate[:, 0:1],
@@ -160,7 +189,22 @@ class MultiScaleTransformerEncoder(nn.Module):
         ], dim=-1)
 
         out = self.out_proj(fused)
-        out = out + self.res_proj(global_repr)
+        if self.residual_mode == "legacy_global" and self.use_global_view:
+            residual_repr = global_repr
+        elif self.residual_mode == "gated_no_global":
+            # Keep the global view in the learned MLP fusion while removing
+            # only its shortcut contribution for a controlled ablation.
+            residual_repr = (
+                token_repr * gate[:, 0:1]
+                + phrase_repr * gate[:, 1:2]
+            )
+        else:
+            residual_repr = (
+                token_repr * gate[:, 0:1]
+                + phrase_repr * gate[:, 1:2]
+                + global_repr * gate[:, 2:3]
+            )
+        out = out + self.res_proj(residual_repr)
         out = F.normalize(out, p=2, dim=-1)
         return out
 

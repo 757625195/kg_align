@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
+from torch_geometric.utils import softmax
 
 
 def mean_neighbor_aggregate(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     """
     Mean aggregation over incoming neighbors with self-loop preservation.
-    This helper is used both by the depthwise-separable graph layer and by the
-    explicit 2/3-hop topology matching objective.
+    This helper is used by the depthwise-separable graph layer.
     """
     src, dst = edge_index
     out = x.new_zeros(x.size(0), x.size(1))
@@ -54,8 +54,10 @@ class RelationAwareGraphConv(nn.Module):
         in_dim: int,
         out_dim: int,
         num_relations: int,
+        use_relation_types: bool = True,
     ):
         super().__init__()
+        self.use_relation_types = use_relation_types
         self.rel_emb = nn.Embedding(num_relations, in_dim)
         self.src_proj = nn.Linear(in_dim, out_dim, bias=False)
         self.rel_proj = nn.Linear(in_dim, out_dim, bias=False)
@@ -70,7 +72,14 @@ class RelationAwareGraphConv(nn.Module):
         edge_type: torch.Tensor,
     ) -> torch.Tensor:
         src, dst = edge_index
-        rel = self.rel_emb(edge_type)
+        if self.use_relation_types:
+            rel = self.rel_emb(edge_type)
+        else:
+            # Keep the relation channel and parameter budget fixed while
+            # removing edge-type identity from every propagated message.
+            rel = self.rel_emb.weight.mean(dim=0, keepdim=True).expand(
+                edge_type.numel(), -1
+            )
         msg = self.src_proj(x[src]) + self.rel_proj(rel)
         msg = self.msg_norm(msg)
 
@@ -177,24 +186,6 @@ class LightweightGNNEncoder(nn.Module):
         h = F.normalize(h, p=2, dim=-1)
         return h
 
-    def collect_k_hop_features(
-        self,
-        z_struct_all: torch.Tensor,
-        edge_index: torch.Tensor,
-        max_hop: int = 3,
-    ) -> dict:
-        """
-        Build explicit 1/2/3-hop topology summaries from the learned structure
-        space. This is used for the topology matching objective.
-        """
-        hop_features = {}
-        h = z_struct_all
-        for hop in range(1, max_hop + 1):
-            h = mean_neighbor_aggregate(h, edge_index)
-            hop_features[hop] = F.normalize(h, p=2, dim=-1)
-        return hop_features
-
-
 class RelationAwareGNNEncoder(nn.Module):
     """
     Relation-aware structural encoder.
@@ -214,6 +205,7 @@ class RelationAwareGNNEncoder(nn.Module):
         dropout: float = 0.1,
         share_parameters: bool = False,
         use_layer_fusion: bool = True,
+        use_relation_types: bool = True,
     ):
         super().__init__()
         assert num_layers >= 1
@@ -233,6 +225,7 @@ class RelationAwareGNNEncoder(nn.Module):
                 in_dim=src_dim,
                 out_dim=dst_dim,
                 num_relations=num_relations,
+                use_relation_types=use_relation_types,
             )
 
         if share_parameters:
@@ -321,15 +314,152 @@ class RelationAwareGNNEncoder(nn.Module):
         h = F.normalize(h, p=2, dim=-1)
         return h
 
-    def collect_k_hop_features(
-        self,
-        z_struct_all: torch.Tensor,
-        edge_index: torch.Tensor,
-        max_hop: int = 3,
-    ) -> dict:
-        hop_features = {}
-        h = z_struct_all
-        for hop in range(1, max_hop + 1):
-            h = mean_neighbor_aggregate(h, edge_index)
-            hop_features[hop] = F.normalize(h, p=2, dim=-1)
-        return hop_features
+
+class RDGCNStructuralEncoder(nn.Module):
+    """Adapted RDGCN entity/relation dual-graph structural encoder."""
+
+    def __init__(self, in_dim, hidden_dim, out_dim, num_relations, num_layers=3, dropout=0.1):
+        super().__init__()
+        self.num_relations = num_relations
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.input_proj = nn.Linear(in_dim, out_dim)
+        self.relation_init = nn.Linear(out_dim * 2, out_dim)
+        self.relation_key = nn.Linear(out_dim, out_dim, bias=False)
+        self.relation_value = nn.Linear(out_dim, out_dim, bias=False)
+        self.relation_query = nn.Linear(out_dim, out_dim, bias=False)
+        self.entity_src = nn.ModuleList(nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_layers))
+        self.entity_rel = nn.ModuleList(nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_layers))
+        self.entity_self = nn.ModuleList(nn.Linear(out_dim, out_dim) for _ in range(num_layers))
+        self.entity_gate = nn.ModuleList(nn.Linear(out_dim * 2, out_dim) for _ in range(num_layers))
+        self.norms = nn.ModuleList(nn.LayerNorm(out_dim) for _ in range(num_layers))
+        self.output_norm = nn.LayerNorm(out_dim)
+        self._dual_graph_cache = {}
+
+    def _relation_means(self, h, edge_index, edge_type):
+        src, dst = edge_index
+        head_sum = h.new_zeros(self.num_relations, h.size(-1))
+        tail_sum = h.new_zeros(self.num_relations, h.size(-1))
+        count = h.new_zeros(self.num_relations)
+        head_sum.index_add_(0, edge_type, h[src])
+        tail_sum.index_add_(0, edge_type, h[dst])
+        count.index_add_(0, edge_type, torch.ones_like(edge_type, dtype=h.dtype))
+        denom = count.clamp(min=1.0).unsqueeze(-1)
+        return self.relation_init(torch.cat([head_sum / denom, tail_sum / denom], dim=-1))
+
+    def _dual_graph(self, edge_index, edge_type):
+        key = (edge_index.data_ptr(), edge_type.data_ptr(), edge_index.size(1))
+        cached = self._dual_graph_cache.get(key)
+        if cached is not None:
+            return cached
+        node_relations = {}
+        src_cpu, dst_cpu = edge_index.detach().cpu()
+        rel_cpu = edge_type.detach().cpu()
+        for src, dst, rel in zip(src_cpu.tolist(), dst_cpu.tolist(), rel_cpu.tolist()):
+            node_relations.setdefault(src, set()).add(rel)
+            node_relations.setdefault(dst, set()).add(rel)
+        dual_edges = set()
+        for relations in node_relations.values():
+            for left in relations:
+                dual_edges.add((left, left))
+                for right in relations:
+                    dual_edges.add((left, right))
+        if not dual_edges:
+            dual_edges = {(rel, rel) for rel in range(self.num_relations)}
+        dual = torch.tensor(sorted(dual_edges), dtype=torch.long, device=edge_index.device).t()
+        self._dual_graph_cache = {key: dual}
+        return dual
+
+    def _update_relations(self, relation_state, dual_edge_index):
+        src, dst = dual_edge_index
+        query = self.relation_query(relation_state[dst])
+        key = self.relation_key(relation_state[src])
+        score = (query * key).sum(dim=-1) / (relation_state.size(-1) ** 0.5)
+        weight = softmax(score, dst, num_nodes=self.num_relations)
+        message = weight.unsqueeze(-1) * self.relation_value(relation_state[src])
+        aggregate = relation_state.new_zeros(relation_state.shape)
+        aggregate.index_add_(0, dst, message)
+        return F.normalize(relation_state + aggregate, p=2, dim=-1)
+
+    def forward(self, x, edge_index, edge_type):
+        h = self.input_proj(x)
+        residual = h
+        dual_edge_index = self._dual_graph(edge_index, edge_type)
+        relation_state = self._relation_means(h, edge_index, edge_type)
+        src, dst = edge_index
+        for layer in range(self.num_layers):
+            relation_state = self._update_relations(relation_state, dual_edge_index)
+            message = self.entity_src[layer](h[src]) + self.entity_rel[layer](relation_state[edge_type])
+            neighbor = h.new_zeros(h.shape)
+            neighbor.index_add_(0, dst, message)
+            degree = h.new_zeros(h.size(0))
+            degree.index_add_(0, dst, torch.ones_like(dst, dtype=h.dtype))
+            neighbor = neighbor / degree.clamp(min=1.0).unsqueeze(-1)
+            self_state = self.entity_self[layer](h)
+            gate = torch.sigmoid(self.entity_gate[layer](torch.cat([self_state, neighbor], dim=-1)))
+            h = self.norms[layer](self_state + gate * neighbor)
+            if layer + 1 < self.num_layers:
+                h = F.relu(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            relation_state = self._relation_means(h, edge_index, edge_type)
+        return F.normalize(self.output_norm(h + residual), p=2, dim=-1)
+
+
+class RREAStructuralEncoder(nn.Module):
+    """RREA-style relation-reflection encoder adapted to the shared EA pipeline."""
+
+    def __init__(self, in_dim, hidden_dim, out_dim, num_relations, num_layers=3, dropout=0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.input_proj = nn.Linear(in_dim, out_dim)
+        self.relation_emb = nn.Embedding(num_relations, out_dim)
+        self.attention = nn.ModuleList(
+            nn.Linear(out_dim * 3, 1, bias=False) for _ in range(num_layers)
+        )
+        self.self_proj = nn.ModuleList(
+            nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_layers)
+        )
+        self.norms = nn.ModuleList(nn.LayerNorm(out_dim) for _ in range(num_layers))
+        # RREA concatenates layer-wise states. Projecting them restores the fixed
+        # output width required by the existing semantic interaction module.
+        self.layer_fusion = nn.Linear(out_dim * (num_layers + 1), out_dim)
+        self.relation_aspect = nn.Linear(out_dim, out_dim, bias=False)
+        self.output_norm = nn.LayerNorm(out_dim)
+
+    @staticmethod
+    def _reflect(entity_state: torch.Tensor, relation_normal: torch.Tensor) -> torch.Tensor:
+        # (I - 2 rr^T)e, evaluated without materializing one matrix per edge.
+        projection = (entity_state * relation_normal).sum(dim=-1, keepdim=True)
+        return entity_state - 2.0 * projection * relation_normal
+
+    def forward(self, x, edge_index, edge_type):
+        h = self.input_proj(x)
+        layer_states = [h]
+        src, dst = edge_index
+        relation_normal = F.normalize(self.relation_emb.weight, p=2, dim=-1)
+
+        for layer in range(self.num_layers):
+            edge_relation = relation_normal[edge_type]
+            reflected = self._reflect(h[src], edge_relation)
+            logits = self.attention[layer](
+                torch.cat([h[dst], reflected, edge_relation], dim=-1)
+            ).squeeze(-1)
+            weights = softmax(F.leaky_relu(logits, negative_slope=0.2), dst, num_nodes=h.size(0))
+            messages = weights.unsqueeze(-1) * reflected
+            neighbor = h.new_zeros(h.shape)
+            neighbor.index_add_(0, dst, messages)
+            h = self.norms[layer](self.self_proj[layer](h) + neighbor)
+            if layer + 1 < self.num_layers:
+                h = F.relu(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            layer_states.append(h)
+
+        structural = self.layer_fusion(torch.cat(layer_states, dim=-1))
+        relation_sum = h.new_zeros(h.shape)
+        relation_sum.index_add_(0, dst, relation_normal[edge_type])
+        degree = h.new_zeros(h.size(0))
+        degree.index_add_(0, dst, torch.ones_like(dst, dtype=h.dtype))
+        relation_aspect = relation_sum / degree.clamp(min=1.0).unsqueeze(-1)
+        output = structural + self.relation_aspect(relation_aspect)
+        return F.normalize(self.output_norm(output), p=2, dim=-1)
